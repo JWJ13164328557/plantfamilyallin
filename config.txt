@@ -1,0 +1,55 @@
+project: "plantfamilyallin_demo"
+family_name: "MY_FAMILY"
+
+target:
+  name: "Target"
+  genome_fa: "data/target/genome.fa"
+  gff3: "data/target/annotation.gff3"
+
+model_family_pep: "data/model/model_family.pep.fa"
+
+pfam_hmm: "db/Pfam-A.hmm"
+pfam_domains_of_interest:
+  - "PF00000"
+
+family_hmm: ""   # 有家族HMM就填路径，否则留空
+
+final_strategy: "intersection"  # intersection / union / blast_and_domain
+
+blast:
+  evalue: 1e-5
+  max_target_seqs: 5
+
+hmm:
+  evalue: 1e-5
+
+meme:
+  nmotifs: 10
+  minw: 6
+  maxw: 50
+  mod: "zoops"
+
+promoter_len: 3000
+
+cis:
+  enable_fimo: false
+  motif_meme_file: "db/plantcis.meme"
+  fimo_pvalue: 1e-4
+
+synteny_species:
+  - name: "Sp1"
+    genome_fa: "data/sp1/genome.fa"
+    gff3: "data/sp1/annotation.gff3"
+  - name: "Sp2"
+    genome_fa: "data/sp2/genome.fa"
+    gff3: "data/sp2/annotation.gff3"
+
+phylo:
+  enable_trim: true
+  trimal_mode: "automated1"
+  iqtree_model: "MFP"
+  bootstrap: 1000
+  alrt: 1000
+
+threads: 10
+outdir: "results"

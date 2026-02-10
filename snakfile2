@@ -1,0 +1,1514 @@
+# -*- coding: utf-8 -*-
+# Open-source ready Snakefile for plantfamilyallin
+# - NO hard-coded /home/liux/... paths
+# - All executables resolved from PATH (optionally overridable via config["tools"])
+# - KaKs_Calculator-3.0 kept (recommended vendored under: resources/KaKs_Calculator-3.0/)
+# - No `run:` blocks (so `--use-conda` is allowed in Snakemake 7.x)
+
+import os
+import sys
+from pathlib import Path
+
+# -------------------------
+# Project paths
+# -------------------------
+PROJDIR = Path(workflow.snakefile).resolve().parent
+PROJ_SCRIPTS = PROJDIR / "scripts"
+PROJ_RES = PROJDIR / "resources"
+
+# -------------------------
+# Config
+# -------------------------
+OUT = config.get("outdir", "results")
+THREADS = int(config.get("threads", 10))
+
+FAMILY = config["family_name"]
+PFAM_IDS = ",".join(config["pfam_domains_of_interest"])
+TARGET = config["target"]["name"]
+T_GENOME = config["target"]["genome_fa"]
+T_GFF = config["target"]["gff3"]
+
+MODEL_PEP = config["model_family_pep"]
+PFAM_HMM = config["pfam_hmm"]
+FAMILY_HMM = config.get("family_hmm", "")
+
+PROMOTER_LEN = int(config.get("promoter_len", 3000))
+FINAL_STRATEGY = config.get("final_strategy", "intersection")
+
+SYNTENY = config.get("synteny_species", [])
+SYNT_NAMES = [s["name"] for s in SYNTENY]
+SYNT_ALL = [TARGET] + SYNT_NAMES
+
+# -------------------------
+# Snakemake python
+# -------------------------
+PY = sys.executable
+
+# -------------------------
+# Tools (PATH-first; optional override by config["tools"])
+# -------------------------
+TOOLS = config.get("tools", {})
+def tool(name, default):
+    return TOOLS.get(name, default)
+
+RSCRIPT    = tool("Rscript", "Rscript")
+DIAMOND    = tool("diamond", "diamond")
+HMMSCAN    = tool("hmmscan", "hmmscan")
+HMMSEARCH  = tool("hmmsearch", "hmmsearch")
+HMMBUILD   = tool("hmmbuild", "hmmbuild")
+HMMpress   = tool("hmmpress", "hmmpress")
+MAFFT_BIN  = tool("mafft", "mafft")
+IQTREE2    = tool("iqtree2", "iqtree2")
+TRIMAL     = tool("trimal", "trimal")
+MCSCANX    = tool("MCScanX", "MCScanX")
+ORTHOFINDER= tool("orthofinder", "orthofinder")
+MEME_BIN   = tool("meme", "meme")
+FIMO_BIN   = tool("fimo", "fimo")
+SAMTOOLS   = tool("samtools", "samtools")
+GFFREAD    = tool("gffread", "gffread")
+AGAT_CONVERT = tool("agat_convert_sp_gff2gff3.pl", "agat_convert_sp_gff2gff3.pl")
+
+# -------------------------
+# KaKs_Calculator-3.0 (vendored)
+# Recommended repo layout:
+#   resources/KaKs_Calculator-3.0/bin/KaKs
+#   resources/KaKs_Calculator-3.0/bin/AXTConvertor
+#   resources/KaKs_Calculator-3.0/pal2nal.pl
+# Config can override: config["kaks"]["kaks_bin_dir"], config["kaks"]["pal2nal"]
+# -------------------------
+KAKS_ENABLE = bool(config.get("kaks", {}).get("enable", True))
+
+DEFAULT_KAKS_ROOT = PROJ_RES / "KaKs_Calculator-3.0"
+DEFAULT_KAKS_BIN_DIR = str(DEFAULT_KAKS_ROOT / "bin")
+DEFAULT_PAL2NAL = str(DEFAULT_KAKS_ROOT / "pal2nal.pl")
+
+KAKS_BIN_DIR = config.get("kaks", {}).get("kaks_bin_dir", DEFAULT_KAKS_BIN_DIR)
+PAL2NAL = config.get("kaks", {}).get("pal2nal", DEFAULT_PAL2NAL)
+MAFFT = config.get("kaks", {}).get("mafft", MAFFT_BIN)
+KAKS_METHOD = config.get("kaks", {}).get("method", "YN")
+
+KAKS_MIN_KS  = float(config.get("kaks", {}).get("min_ks", 0.001))
+KAKS_MAX_KS  = float(config.get("kaks", {}).get("max_ks", 5.0))
+KAKS_MAX_W   = float(config.get("kaks", {}).get("max_kaks", 5.0))
+
+# syntenic_kaks (module 10)
+SYK_ENABLE = bool(config.get("syntenic_kaks", {}).get("enable", True))
+SYK_MIN_KS = float(config.get("syntenic_kaks", {}).get("min_ks", 0.001))
+SYK_MAX_KS = float(config.get("syntenic_kaks", {}).get("max_ks", 5.0))
+SYK_MAX_W  = float(config.get("syntenic_kaks", {}).get("max_kaks", 5.0))
+SYK_EVALUE = config.get("syntenic_kaks", {}).get("diamond_evalue", 1e-5)
+SYK_MTS    = int(config.get("syntenic_kaks", {}).get("diamond_max_target_seqs", 5))
+
+# GENESPACE needs a directory containing MCScanX executable; default "auto"
+MCSCANX_DIR_CFG = config.get("mcscanx_dir", "auto")
+
+# wolfpsort
+WOLF_ENABLE = str(config.get("wolfpsort", {}).get("enable", "false")).strip().lower() in ("1","true","yes","y")
+WOLF_CMD = config.get("wolfpsort", {}).get("cmd", "wolfpsort")
+WOLF_ORG = config.get("wolfpsort", {}).get("organism", "plant")
+
+# phylo
+PHYLO_ENABLE_TRIM = str(config.get("phylo", {}).get("enable_trim", True)).strip().lower() not in ("0","false","no","n")
+PHYLO_TRIMAL_MODE = config.get("phylo", {}).get("trimal_mode", "automated1")
+
+# cis / fimo
+CIS_ENABLE_FIMO = str(config.get("cis", {}).get("enable_fimo", False)).strip().lower() in ("1","true","yes","y")
+CIS_MOTIF = config.get("cis", {}).get("motif_meme_file", "")
+CIS_PVAL = config.get("cis", {}).get("fimo_pvalue", 1e-4)
+
+# synteny (genespace)
+SYNTENY_ENABLE_GENESPACE = str(config.get("synteny", {}).get("enable_genespace", True)).strip().lower() in ("1","true","yes","y")
+
+# -------------------------
+# Outputs
+# -------------------------
+def opt(path, enabled=True):
+    return [path] if enabled else []
+
+KAKS_OUTDIR = f"{OUT}/09.selection"
+KAKS_PAIRS  = f"{KAKS_OUTDIR}/pairs.tsv"
+KAKS_RAW    = f"{KAKS_OUTDIR}/kaks/kaks.raw.tsv"
+KAKS_FILT   = f"{KAKS_OUTDIR}/kaks/kaks.filtered.tsv"
+
+SYK_OUTDIR  = f"{OUT}/10.syntenic_kaks"
+SYK_MCS_DIR = f"{SYK_OUTDIR}/mcscanx/{TARGET}_self"
+SYK_PREFIX  = f"{SYK_MCS_DIR}/{TARGET}_self"
+SYK_PAIRS   = f"{SYK_OUTDIR}/pairs.tsv"
+SYK_COL     = f"{SYK_PREFIX}.collinearity"
+SYK_RAW     = f"{SYK_OUTDIR}/kaks/kaks.raw.tsv"
+SYK_FILT    = f"{SYK_OUTDIR}/kaks/kaks.filtered.tsv"
+
+GENESPACE_WD   = f"{OUT}/07.synteny/genespace/wd"
+GENESPACE_GENOMES = ",".join(SYNT_ALL)
+
+# -------------------------
+# rule all (conditional)
+# -------------------------
+rule all:
+    input:
+        # Module 1
+        f"{OUT}/01.cds_protein/target.pep.longest.fa",
+        f"{OUT}/01.cds_protein/target.cds.longest.fa",
+
+        # Module 2
+        f"{OUT}/02.family_id/blast_candidates.list",
+        f"{OUT}/02.family_id/pfam_candidates.list",
+        f"{OUT}/02.family_id/hmm_candidates.list",
+        f"{OUT}/02.family_id/final_family_members.list",
+        f"{OUT}/99.result/{FAMILY}_Venn.pdf",
+
+        # Module 3
+        f"{OUT}/03.chromosome_map/family_genes.bed",
+        f"{OUT}/99.result/{FAMILY}_ChrMap.pdf",
+
+        # Module 4
+        f"{OUT}/04.meme_structure/meme_out/meme.html",
+        f"{OUT}/04.meme_structure/meme_out/domain.tsv",
+        f"{OUT}/04.meme_structure/meme_out/gene_structure.tsv",
+        f"{OUT}/99.result/{FAMILY}_MotifTree.pdf",
+
+        # Module 5 (+ optional cis summary always produced; if disabled -> dummy)
+        f"{OUT}/05.promoter_cis/family_promoter_{PROMOTER_LEN}bp.fa",
+        f"{OUT}/05.promoter_cis/cis_summary.tsv",
+        f"{OUT}/99.result/{FAMILY}_CisSummary.pdf",
+
+        # Module 6
+        f"{OUT}/06.protein_property/{FAMILY}_protein_properties.csv",
+
+        # Module 7 (genespace optional)
+        *opt(f"{OUT}/07.synteny/genomes.tsv", True),
+        *opt(f"{OUT}/07.synteny/genespace/genespace.gsParam.rds", SYNTENY_ENABLE_GENESPACE),
+        *opt(f"{OUT}/99.result/GENESPACE_riparian.pdf", SYNTENY_ENABLE_GENESPACE),
+
+        # Module 8
+        f"{OUT}/08.phylogeny/{FAMILY}.treefile",
+        f"{OUT}/99.result/{FAMILY}_PhyloTree.pdf",
+
+        # Module 9 (Ka/Ks optional)
+        *opt(f"{KAKS_FILT}", KAKS_ENABLE),
+        *opt(f"{OUT}/99.result/Ks_distribution.pdf", KAKS_ENABLE),
+        *opt(f"{OUT}/99.result/KaKs_distribution.pdf", KAKS_ENABLE),
+        *opt(f"{OUT}/99.result/Ka_vs_Ks_scatter.pdf", KAKS_ENABLE),
+
+        # Module 10 (syntenic_kaks optional)
+        *opt(f"{SYK_FILT}", SYK_ENABLE and KAKS_ENABLE),
+        *opt(f"{OUT}/99.result/Ks_family_vs_syntenic.pdf", SYK_ENABLE and KAKS_ENABLE),
+
+# =========================
+# Module 1: GFF clean + OOB filter + CDS/PEP + longest isoform
+# =========================
+rule agat_clean_gff:
+    input:
+        T_GFF
+    output:
+        f"{OUT}/01.cds_protein/annotation.clean.gff3"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/01.cds_protein"
+        command -v {AGAT_CONVERT} >/dev/null 2>&1 || (echo "[ERROR] agat_convert_sp_gff2gff3.pl not found in PATH" && exit 1)
+        {AGAT_CONVERT} -g "{input}" -o "{output}"
+        """
+
+rule filter_oob_target_gff:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.gff3",
+        genome=T_GENOME
+    output:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        kill=f"{OUT}/01.cds_protein/out_of_bounds.kill.txt"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+
+        command -v {SAMTOOLS} >/dev/null 2>&1 || (echo "[ERROR] samtools not found in PATH" && exit 1)
+        {SAMTOOLS} faidx "{input.genome}"
+
+        awk 'BEGIN{FS="\t"}
+             NR==FNR{len[$1]=$2; next}
+             ($1 in len) && ($4<1 || $5>len[$1]) {
+                 if (match($9,/Parent=([^;]+)/,a)) {
+                     n=split(a[1],p,","); for(i=1;i<=n;i++) print p[i];
+                 } else if (match($9,/ID=([^;]+)/,b)) {
+                     print b[1];
+                 }
+             }' "{input.genome}.fai" "{input.gff}" | sort -u > "{output.kill}"
+
+        if [ -s "{output.kill}" ]; then
+            PREFIX="$(cd "$(dirname "$(command -v {AGAT_CONVERT})")/.." && pwd)"
+            PERL="$PREFIX/bin/perl"
+            FILTER="$PREFIX/bin/agat_sp_filter_feature_from_kill_list.pl"
+            env -u PERL5LIB -u PERL5OPT -u PERL_LOCAL_LIB_ROOT -u PERL_MB_OPT -u PERL_MM_OPT \
+              "$PERL" "$FILTER" \
+                --gff "{input.gff}" \
+                --kill_list "{output.kill}" \
+                --output "{output.gff}"
+        else
+            cp "{input.gff}" "{output.gff}"
+        fi
+        """
+
+rule extract_cds_pep:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        genome=T_GENOME
+    output:
+        cds=f"{OUT}/01.cds_protein/target.cds.fa",
+        pep=f"{OUT}/01.cds_protein/target.pep.fa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        command -v {GFFREAD} >/dev/null 2>&1 || (echo "[ERROR] gffread not found in PATH" && exit 1)
+        {GFFREAD} "{input.gff}" -g "{input.genome}" -x "{output.cds}"
+        {GFFREAD} "{input.gff}" -g "{input.genome}" -y "{output.pep}"
+        """
+
+rule longest_isoform:
+    input:
+        cds=f"{OUT}/01.cds_protein/target.cds.fa",
+        pep=f"{OUT}/01.cds_protein/target.pep.fa"
+    output:
+        cds=f"{OUT}/01.cds_protein/target.cds.longest.fa",
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa",
+        map=f"{OUT}/01.cds_protein/longest_isoform_map.tsv"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/gff_longest_isoform.py" \
+          --cds "{input.cds}" --pep "{input.pep}" \
+          --out_cds "{output.cds}" --out_pep "{output.pep}" \
+          --out_map "{output.map}"
+        """
+
+# =========================
+# Module 2: BLAST + Pfam + HMM + Venn + final members
+# =========================
+rule diamond_db:
+    input:
+        f"{OUT}/01.cds_protein/target.pep.longest.fa"
+    output:
+        f"{OUT}/02.family_id/target.dmnd"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/02.family_id"
+        command -v {DIAMOND} >/dev/null 2>&1 || (echo "[ERROR] diamond not found in PATH" && exit 1)
+        {DIAMOND} makedb --in "{input}" -d "{OUT}/02.family_id/target"
+        """
+
+rule blast_model_vs_target:
+    input:
+        dmnd=f"{OUT}/02.family_id/target.dmnd",
+        query=MODEL_PEP
+    output:
+        tsv=f"{OUT}/02.family_id/blast_model_vs_target.tsv"
+    threads: THREADS
+    params:
+        evalue=config["blast"]["evalue"],
+        max_target_seqs=config["blast"]["max_target_seqs"]
+    shell:
+        r"""
+        set -euo pipefail
+        {DIAMOND} blastp \
+          -q "{input.query}" \
+          -d "{OUT}/02.family_id/target" \
+          -o "{output.tsv}" \
+          -f 6 qseqid sseqid pident length qlen slen qstart qend sstart send evalue bitscore \
+          -e "{params.evalue}" \
+          --max-target-seqs "{params.max_target_seqs}" \
+          --threads {threads}
+        """
+
+rule blast_candidates:
+    input:
+        f"{OUT}/02.family_id/blast_model_vs_target.tsv"
+    output:
+        f"{OUT}/02.family_id/blast_candidates.list"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/list_ops.py" blast_candidates \
+          --blast_tsv "{input}" \
+          --out "{output}"
+        """
+
+rule pfam_scan:
+    input:
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa"
+    output:
+        domtbl=f"{OUT}/02.family_id/pfam.domtblout",
+        log=f"{OUT}/02.family_id/pfam.hmmscan.log"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/02.family_id"
+        command -v {HMMSCAN} >/dev/null 2>&1 || (echo "[ERROR] hmmscan not found in PATH" && exit 1)
+        command -v {HMMpress} >/dev/null 2>&1 || (echo "[ERROR] hmmpress not found in PATH" && exit 1)
+
+        PFAM="{PFAM_HMM}"
+
+        missing=0
+        for ext in h3f h3i h3m h3p; do
+          [ -f "${PFAM}.${ext}" ] || missing=1
+        done
+
+        if [ $missing -eq 1 ]; then
+          rm -f "${PFAM}.h3f" "${PFAM}.h3i" "${PFAM}.h3m" "${PFAM}.h3p"
+          {HMMpress} "${PFAM}"
+        fi
+
+        {HMMSCAN} --cpu {threads} --domtblout "{output.domtbl}" "${PFAM}" "{input.pep}" > "{output.log}"
+        """
+
+rule pfam_candidates:
+    input:
+        domtbl=f"{OUT}/02.family_id/pfam.domtblout"
+    output:
+        f"{OUT}/02.family_id/pfam_candidates.list"
+    threads: THREADS
+    params:
+        pfam_ids=PFAM_IDS
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/parse_domtblout_pfam.py" \
+          --domtbl "{input.domtbl}" \
+          --pfam_ids "{params.pfam_ids}" \
+          --out "{output}"
+        """
+
+rule build_family_hmm_if_needed:
+    input:
+        MODEL_PEP
+    output:
+        hmm=f"{OUT}/02.family_id/family.hmm"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/02.family_id"
+        command -v {MAFFT_BIN} >/dev/null 2>&1 || (echo "[ERROR] mafft not found in PATH" && exit 1)
+        command -v {HMMBUILD} >/dev/null 2>&1 || (echo "[ERROR] hmmbuild not found in PATH" && exit 1)
+
+        {MAFFT_BIN} --auto --thread {threads} "{input}" > "{OUT}/02.family_id/model_family.aln.fa"
+        {HMMBUILD} "{output.hmm}" "{OUT}/02.family_id/model_family.aln.fa"
+        test -s "{output.hmm}"
+        """
+
+rule hmm_search:
+    input:
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa",
+        hmm=lambda wc: FAMILY_HMM if FAMILY_HMM else f"{OUT}/02.family_id/family.hmm"
+    output:
+        domtbl=f"{OUT}/02.family_id/hmm.domtblout",
+        log=f"{OUT}/02.family_id/hmmsearch.log"
+    threads: THREADS
+    params:
+        evalue=config["hmm"]["evalue"]
+    shell:
+        r"""
+        set -euo pipefail
+        command -v {HMMSEARCH} >/dev/null 2>&1 || (echo "[ERROR] hmmsearch not found in PATH" && exit 1)
+        {HMMSEARCH} --cpu {threads} --domtblout "{output.domtbl}" -E "{params.evalue}" "{input.hmm}" "{input.pep}" > "{output.log}"
+        """
+
+rule hmm_candidates:
+    input:
+        f"{OUT}/02.family_id/hmm.domtblout"
+    output:
+        f"{OUT}/02.family_id/hmm_candidates.list"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/parse_domtblout_hmm.py" --domtbl "{input}" --out "{output}"
+        """
+
+rule final_members:
+    input:
+        blast=f"{OUT}/02.family_id/blast_candidates.list",
+        pfam=f"{OUT}/02.family_id/pfam_candidates.list",
+        hmm=f"{OUT}/02.family_id/hmm_candidates.list"
+    output:
+        out_list=f"{OUT}/02.family_id/final_family_members.list",
+        venn_tsv=f"{OUT}/02.family_id/venn_input.tsv"
+    threads: THREADS
+    params:
+        strategy=FINAL_STRATEGY
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/list_ops.py" final_members \
+          --blast "{input.blast}" --pfam "{input.pfam}" --hmm "{input.hmm}" \
+          --strategy "{params.strategy}" \
+          --out_list "{output.out_list}" \
+          --out_venn_tsv "{output.venn_tsv}"
+        """
+
+rule plot_venn:
+    input:
+        f"{OUT}/02.family_id/venn_input.tsv"
+    output:
+        f"{OUT}/99.result/{FAMILY}_Venn.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/99.result"
+        command -v {RSCRIPT} >/dev/null 2>&1 || (echo "[ERROR] Rscript not found in PATH" && exit 1)
+        {RSCRIPT} "{PROJ_SCRIPTS}/plot_venn.R" \
+          --venn_tsv "{input}" \
+          --family "{FAMILY}" \
+          --out "{output}"
+        """
+
+# =========================
+# Module 3: Chromosome map
+# =========================
+rule faidx:
+    input:
+        T_GENOME
+    output:
+        f"{OUT}/03.chromosome_map/chr.length"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/03.chromosome_map"
+        {SAMTOOLS} faidx "{input}"
+        cut -f1,2 "{input}.fai" > "{output}"
+        """
+
+rule extract_family_bed:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        genes=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        f"{OUT}/03.chromosome_map/family_genes.bed"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/03.chromosome_map"
+
+        awk 'BEGIN{FS="\t"; OFS="\t"}
+             NR==FNR{keep[$1]=1; next}
+             $0!~/^#/ && ($3=="mRNA" || $3=="transcript") {
+                id=""
+                if (match($9,/ID=([^;]+)/,a)) id=a[1]
+                if (id!="" && (id in keep)) {
+                   s=$4-1; if (s<0) s=0
+                   print $1, s, $5, id, 0, $7
+                }
+             }' "{input.genes}" "{input.gff}" \
+          | sort -k1,1 -k2,2n > "{output}"
+        """
+
+rule plot_chr_map:
+    input:
+        bed=f"{OUT}/03.chromosome_map/family_genes.bed",
+        chrlen=f"{OUT}/03.chromosome_map/chr.length"
+    output:
+        f"{OUT}/99.result/{FAMILY}_ChrMap.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/99.result"
+        {RSCRIPT} "{PROJ_SCRIPTS}/plot_chr_map.R" \
+          --bed "{input.bed}" \
+          --chrlen "{input.chrlen}" \
+          --family "{FAMILY}" \
+          --out "{output}"
+        """
+
+# =========================
+# Module 4: Family PEP + MEME + domain + gene structure + tree motif plot
+# =========================
+rule extract_family_pep:
+    input:
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa",
+        genes=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        f"{OUT}/04.meme_structure/final_family.pep.fa"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/04.meme_structure"
+        "{PY}" "{PROJ_SCRIPTS}/list_ops.py" extract_fasta \
+          --fasta "{input.pep}" --ids "{input.genes}" --out "{output}"
+        """
+
+rule meme_run:
+    input:
+        f"{OUT}/04.meme_structure/final_family.pep.fa"
+    output:
+        html=f"{OUT}/04.meme_structure/meme_out/meme.html",
+        txt=f"{OUT}/04.meme_structure/meme_out/meme.txt",
+        xml=f"{OUT}/04.meme_structure/meme_out/meme.xml"
+    threads: 1
+    params:
+        nmotifs=config["meme"]["nmotifs"],
+        minw=config["meme"]["minw"],
+        maxw=config["meme"]["maxw"],
+        mod=config["meme"]["mod"]
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/04.meme_structure/meme_out"
+        command -v {MEME_BIN} >/dev/null 2>&1 || (echo "[ERROR] meme not found in PATH" && exit 1)
+
+        {MEME_BIN} "{input}" -oc "{OUT}/04.meme_structure/meme_out" \
+          -protein -mod "{params.mod}" -nmotifs "{params.nmotifs}" -minw "{params.minw}" -maxw "{params.maxw}"
+
+        test -s "{output.txt}"
+        test -s "{output.xml}"
+        test -s "{output.html}"
+        """
+
+rule pfam_domain_tsv:
+    input:
+        domtbl=f"{OUT}/02.family_id/pfam.domtblout",
+        fam=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        tsv=f"{OUT}/04.meme_structure/meme_out/domain.tsv"
+    threads: 1
+    params:
+        pfam_keep=PFAM_IDS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/04.meme_structure/meme_out"
+
+        "{PY}" "{PROJ_SCRIPTS}/domtblout_to_domain_tsv.py" \
+          --domtbl "{input.domtbl}" \
+          --out "{output.tsv}" \
+          --only_pfam "{params.pfam_keep}" \
+          --min_iE 1e-3
+
+        awk 'BEGIN{FS=OFS="\t"} NR==FNR{keep[$1]=1;next} NR==1 || ($1 in keep)' \
+          "{input.fam}" "{output.tsv}" > "{output.tsv}.tmp"
+        mv "{output.tsv}.tmp" "{output.tsv}"
+        """
+
+rule gene_structure_tsv:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        fam=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        tsv=f"{OUT}/04.meme_structure/meme_out/gene_structure.tsv"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/04.meme_structure/meme_out"
+        "{PY}" "{PROJ_SCRIPTS}/gff3_to_gene_structure_tsv.py" \
+          --gff "{input.gff}" \
+          --ids "{input.fam}" \
+          --out "{output.tsv}" \
+          --features "exon,CDS,five_prime_UTR,three_prime_UTR,UTR"
+        """
+
+rule meme_tree_mafft:
+    input:
+        pep=f"{OUT}/04.meme_structure/final_family.pep.fa"
+    output:
+        aln=f"{OUT}/04.meme_structure/final_family.pep.aln.fa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        {MAFFT_BIN} --auto --thread {threads} "{input.pep}" > "{output.aln}"
+        test -s "{output.aln}"
+        """
+
+rule meme_tree_iqtree_quick:
+    input:
+        aln=f"{OUT}/04.meme_structure/final_family.pep.aln.fa"
+    output:
+        tree=f"{OUT}/04.meme_structure/final_family.treefile"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        command -v {IQTREE2} >/dev/null 2>&1 || (echo "[ERROR] iqtree2 not found in PATH" && exit 1)
+
+        CORES=$("{PY}" - <<'PY'
+import os
+try:
+    print(len(os.sched_getaffinity(0)))
+except Exception:
+    print(1)
+PY
+)
+        if [ -z "$CORES" ] || [ "$CORES" -lt 1 ]; then CORES=$(nproc 2>/dev/null || echo 1); fi
+        T=$(( {threads} < CORES ? {threads} : CORES ))
+        [ "$T" -ge 1 ] || T=1
+
+        {IQTREE2} -s "{input.aln}" -m MFP -T $T -fast -pre "{OUT}/04.meme_structure/final_family"
+        test -s "{output.tree}"
+        """
+
+rule meme_parse_sites:
+    input:
+        pep=f"{OUT}/04.meme_structure/final_family.pep.fa",
+        meme_txt=f"{OUT}/04.meme_structure/meme_out/meme.txt"
+    output:
+        hits=f"{OUT}/04.meme_structure/meme_out/motif_hits.tsv",
+        lens=f"{OUT}/04.meme_structure/meme_out/protein_len.tsv"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/parse_meme_sites.py" \
+          --pep "{input.pep}" \
+          --meme_txt "{input.meme_txt}" \
+          --out_hits "{output.hits}" \
+          --out_lens "{output.lens}"
+        """
+
+rule meme_tree_motif_plot:
+    input:
+        tree=f"{OUT}/04.meme_structure/final_family.treefile",
+        hits=f"{OUT}/04.meme_structure/meme_out/motif_hits.tsv",
+        lens=f"{OUT}/04.meme_structure/meme_out/protein_len.tsv",
+        domain=f"{OUT}/04.meme_structure/meme_out/domain.tsv",
+        gene=f"{OUT}/04.meme_structure/meme_out/gene_structure.tsv"
+    output:
+        pdf=f"{OUT}/99.result/{FAMILY}_MotifTree.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/99.result"
+        {RSCRIPT} "{PROJ_SCRIPTS}/plot_meme_tree.R" \
+          --tree "{input.tree}" \
+          --motif_tsv "{input.hits}" \
+          --len_tsv "{input.lens}" \
+          --domain_tsv "{input.domain}" \
+          --gene_tsv "{input.gene}" \
+          --family "{FAMILY}" \
+          --out "{output.pdf}"
+        """
+
+# =========================
+# Module 5: Promoter + optional FIMO (always generates outputs; if disabled -> dummy)
+# =========================
+rule promoter_fasta:
+    input:
+        genome=T_GENOME,
+        chrlen=f"{OUT}/03.chromosome_map/chr.length",
+        bed=f"{OUT}/03.chromosome_map/family_genes.bed"
+    output:
+        fa=f"{OUT}/05.promoter_cis/family_promoter_{PROMOTER_LEN}bp.fa",
+        bed=f"{OUT}/05.promoter_cis/family_promoter_{PROMOTER_LEN}bp.bed"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/05.promoter_cis"
+        bash "{PROJ_SCRIPTS}/promoter_extract.sh" \
+          "{input.bed}" "{input.chrlen}" "{input.genome}" "{PROMOTER_LEN}" \
+          "{output.bed}" "{output.fa}"
+        test -s "{output.fa}"
+        test -s "{output.bed}"
+        """
+
+rule fimo_scan_optional:
+    input:
+        fa=f"{OUT}/05.promoter_cis/family_promoter_{PROMOTER_LEN}bp.fa",
+        motif=lambda wc: CIS_MOTIF
+    output:
+        summary=f"{OUT}/05.promoter_cis/cis_summary.tsv",
+        plot=f"{OUT}/99.result/{FAMILY}_CisSummary.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/05.promoter_cis" "{OUT}/99.result"
+
+        ENABLE="{str(CIS_ENABLE_FIMO).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          echo -e 'motif_id\tcount' > "{output.summary}"
+          {RSCRIPT} -e "pdf('{output.plot}'); plot.new(); text(0.5,0.5,'FIMO disabled'); dev.off()"
+          exit 0
+        fi
+
+        if [ -z "{input.motif}" ] || [ ! -s "{input.motif}" ]; then
+          echo "[ERROR] cis.motif_meme_file is empty or not found: {input.motif}" >&2
+          exit 1
+        fi
+
+        command -v {FIMO_BIN} >/dev/null 2>&1 || (echo "[ERROR] fimo not found in PATH" && exit 1)
+
+        mkdir -p "{OUT}/05.promoter_cis/fimo_out"
+        {FIMO_BIN} --oc "{OUT}/05.promoter_cis/fimo_out" --thresh "{CIS_PVAL}" "{input.motif}" "{input.fa}"
+
+        "{PY}" "{PROJ_SCRIPTS}/cis_fimo_summary.py" \
+          --fimo "{OUT}/05.promoter_cis/fimo_out/fimo.tsv" \
+          --out "{output.summary}"
+
+        {RSCRIPT} "{PROJ_SCRIPTS}/plot_cis_summary.R" \
+          --in_tsv "{output.summary}" \
+          --family "{FAMILY}" \
+          --out "{output.plot}"
+
+        test -s "{output.summary}"
+        test -s "{output.plot}"
+        """
+
+# =========================
+# Module 6: Protein properties (+ wolfpsort optional)
+# =========================
+rule wolfpsort_predict:
+    input:
+        pep=f"{OUT}/04.meme_structure/final_family.pep.fa"
+    output:
+        tsv=f"{OUT}/06.protein_property/wolfpsort.tsv"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/06.protein_property"
+        ENABLE="{str(WOLF_ENABLE).lower()}"
+
+        if [[ "$ENABLE" == "true" ]]; then
+          "{PY}" "{PROJ_SCRIPTS}/wolfpsort_predict.py" \
+            --pep "{input.pep}" \
+            --out "{output.tsv}" \
+            --cmd "{WOLF_CMD}" \
+            --organism "{WOLF_ORG}"
+        else
+          echo -e 'seq_id\twolf_loc\twolf_score\twolf_scores' > "{output.tsv}"
+        fi
+        test -s "{output.tsv}"
+        """
+
+rule protein_properties:
+    input:
+        pep=f"{OUT}/04.meme_structure/final_family.pep.fa",
+        wolf=f"{OUT}/06.protein_property/wolfpsort.tsv"
+    output:
+        f"{OUT}/06.protein_property/{FAMILY}_protein_properties.csv"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/06.protein_property"
+        "{PY}" "{PROJ_SCRIPTS}/protein_properties.py" \
+          --pep "{input.pep}" \
+          --wolf_tsv "{input.wolf}" \
+          --out "{output}"
+        test -s "{output}"
+        """
+
+# =========================
+# Module 7: Synteny prep + GENESPACE (optional)
+# =========================
+rule prep_species_for_mcscanx:
+    input:
+        gff=lambda wc: T_GFF if wc.sp == TARGET else [s for s in SYNTENY if s["name"] == wc.sp][0]["gff3"],
+        genome=lambda wc: T_GENOME if wc.sp == TARGET else [s for s in SYNTENY if s["name"] == wc.sp][0]["genome_fa"]
+    output:
+        clean_gff=f"{OUT}/07.synteny/{{sp}}/ann.clean.gff3",
+        filtered_gff=f"{OUT}/07.synteny/{{sp}}/ann.clean.filtered.gff3",
+        kill=f"{OUT}/07.synteny/{{sp}}/out_of_bounds.kill.txt",
+        pep=f"{OUT}/07.synteny/{{sp}}/pep.fa",
+        bed=f"{OUT}/07.synteny/{{sp}}/genes.bed"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/07.synteny/{wildcards.sp}"
+
+        {AGAT_CONVERT} -g "{input.gff}" -o "{output.clean_gff}"
+
+        {SAMTOOLS} faidx "{input.genome}"
+
+        awk 'BEGIN{FS="\t"}
+             NR==FNR{len[$1]=$2; next}
+             ($1 in len) && ($4<1 || $5>len[$1]) {
+                 if (match($9,/Parent=([^;]+)/,a)) {
+                     n=split(a[1],p,","); for(i=1;i<=n;i++) print p[i];
+                 } else if (match($9,/ID=([^;]+)/,b)) {
+                     print b[1];
+                 }
+             }' "{input.genome}.fai" "{output.clean_gff}" | sort -u > "{output.kill}"
+
+        if [ -s "{output.kill}" ]; then
+            PREFIX="$(cd "$(dirname "$(command -v {AGAT_CONVERT})")/.." && pwd)"
+            PERL="$PREFIX/bin/perl"
+            FILTER="$PREFIX/bin/agat_sp_filter_feature_from_kill_list.pl"
+            env -u PERL5LIB -u PERL5OPT -u PERL_LOCAL_LIB_ROOT -u PERL_MB_OPT -u PERL_MM_OPT \
+              "$PERL" "$FILTER" \
+                --gff "{output.clean_gff}" \
+                --kill_list "{output.kill}" \
+                --output "{output.filtered_gff}"
+        else
+            cp "{output.clean_gff}" "{output.filtered_gff}"
+        fi
+
+        {GFFREAD} "{output.filtered_gff}" -g "{input.genome}" -y "{output.pep}"
+
+        awk 'BEGIN{FS="\t"; OFS="\t"}
+             $0 !~ /^#/ && ($3=="mRNA" || $3=="transcript") {
+                id="";
+                if (match($9,/ID=([^;]+)/,a)) id=a[1];
+                if (id!="") {
+                   s=$4-1; if (s<0) s=0;
+                   print $1, s, $5, id, 0, $7
+                }
+             }' "{output.filtered_gff}" | sort -k1,1 -k2,2n > "{output.bed}"
+
+        test -s "{output.filtered_gff}"
+        test -s "{output.pep}"
+        test -s "{output.bed}"
+        """
+
+rule synteny_genomes_manifest:
+    input:
+        prep_pep=expand(f"{OUT}/07.synteny/{{sp}}/pep.fa", sp=SYNT_ALL),
+        prep_gff=expand(f"{OUT}/07.synteny/{{sp}}/ann.clean.filtered.gff3", sp=SYNT_ALL)
+    output:
+        tsv=f"{OUT}/07.synteny/genomes.tsv"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/07.synteny"
+        "{PY}" - <<'PY'
+import os
+from pathlib import Path
+OUT = r"{OUT}"
+species = {SYNT_ALL!r}
+out = Path(r"{output.tsv}")
+out.parent.mkdir(parents=True, exist_ok=True)
+with open(out, "w") as w:
+    w.write("genomeID\tgff3\tpep\n")
+    for sp in species:
+        gff = f"{OUT}/07.synteny/{sp}/ann.clean.filtered.gff3"
+        pep = f"{OUT}/07.synteny/{sp}/pep.fa"
+        if not (os.path.exists(gff) and os.path.getsize(gff) > 0):
+            raise SystemExit(f"[ERROR] missing/empty gff: {gff}")
+        if not (os.path.exists(pep) and os.path.getsize(pep) > 0):
+            raise SystemExit(f"[ERROR] missing/empty pep: {pep}")
+        w.write(f"{sp}\t{gff}\t{pep}\n")
+PY
+        test -s "{output.tsv}"
+        """
+
+rule genespace_prepare_wd:
+    input:
+        bed=f"{OUT}/07.synteny/{{sp}}/genes.bed",
+        pep=f"{OUT}/07.synteny/{{sp}}/pep.fa"
+    output:
+        bed_out=f"{GENESPACE_WD}/bed/{{sp}}.bed",
+        pep_out=f"{GENESPACE_WD}/peptide/{{sp}}.fa"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{GENESPACE_WD}/bed" "{GENESPACE_WD}/peptide"
+
+        SP="{wildcards.sp}"
+
+        awk -v SP="$SP" '
+          /^>/ {
+            sub(/^>/, ">"SP"|");
+            print;
+            next
+          }
+          {
+            gsub(/\r/, "");
+            gsub(/\./, "X");
+            gsub(/\*/, "");
+            gsub(/[^A-Za-z]/, "X");
+            print toupper($0)
+          }
+        ' "{input.pep}" > "{output.pep_out}"
+
+        grep '^>' "{output.pep_out}" | sed 's/^>//; s/[[:space:]].*$//' | sort -u > "{output.pep_out}.ids"
+
+        awk -v SP="$SP" 'BEGIN{FS=OFS="\t"}{
+            id=SP"|" $4;
+            chr=SP"_"$1;
+            if (chr ~ /^[0-9]+$/ || chr == "") chr = SP"_chr"chr;
+            print chr, $2, $3, id
+        }' "{input.bed}" \
+          | awk 'BEGIN{FS=OFS="\t"} NR==FNR{ok[$1]=1; next} ($4 in ok)' "{output.pep_out}.ids" - \
+          > "{output.bed_out}"
+
+        rm -f "{output.pep_out}.ids"
+        test -s "{output.bed_out}"
+        test -s "{output.pep_out}"
+        """
+
+GS_BEDS = expand(f"{GENESPACE_WD}/bed/{{sp}}.bed", sp=SYNT_ALL)
+GS_PEPS = expand(f"{GENESPACE_WD}/peptide/{{sp}}.fa", sp=SYNT_ALL)
+
+rule run_genespace:
+    input:
+        beds=GS_BEDS,
+        peps=GS_PEPS
+    output:
+        rds=f"{OUT}/07.synteny/genespace/genespace.gsParam.rds",
+        pdf=f"{OUT}/99.result/GENESPACE_riparian.pdf"
+    log:
+        f"{OUT}/07.synteny/genespace/genespace.run.log"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYNTENY_ENABLE_GENESPACE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          echo "[INFO] GENESPACE disabled by config. Skipping." > "{log}"
+          exit 0
+        fi
+
+        mkdir -p "{OUT}/07.synteny/genespace" "{OUT}/99.result"
+
+        command -v {ORTHOFINDER} >/dev/null 2>&1 || (echo "[ERROR] orthofinder not found in PATH" && exit 1)
+        command -v {MCSCANX} >/dev/null 2>&1 || (echo "[ERROR] MCScanX not found in PATH" && exit 1)
+
+        MCSCANX_DIR="{MCSCANX_DIR_CFG}"
+        if [ -z "$MCSCANX_DIR" ] || [ "$MCSCANX_DIR" = "auto" ]; then
+          MCSCANX_DIR="$(dirname "$(command -v {MCSCANX})")"
+        fi
+
+        {{
+          echo "[DEBUG] date: $(date)"
+          echo -n "[DEBUG] orthofinder="; command -v {ORTHOFINDER} || true
+          {ORTHOFINDER} -h | head -n 3 || true
+
+          echo "[DEBUG] mcscanx_dir=$MCSCANX_DIR"
+          echo "[DEBUG] run Rscript..."
+          {RSCRIPT} "{PROJ_SCRIPTS}/run_genespace.R" \
+            --wd "{GENESPACE_WD}" \
+            --path2mcscanx "$MCSCANX_DIR" \
+            --genomes "{GENESPACE_GENOMES}" \
+            --overwrite \
+            --ref "{TARGET}" \
+            --out_rds "{output.rds}" \
+            --out_pdf "{output.pdf}" \
+            --skip_parse
+        }} > "{log}" 2>&1
+
+        test -s "{output.rds}"
+        test -s "{output.pdf}"
+        """
+
+# =========================
+# Module 8: Phylogeny
+# =========================
+rule phylo_merge_fasta:
+    input:
+        target=f"{OUT}/04.meme_structure/final_family.pep.fa",
+        model=MODEL_PEP
+    output:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.pep.fa"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/08.phylogeny"
+        "{PY}" "{PROJ_SCRIPTS}/merge_prefix_fasta.py" \
+          --target_fa "{input.target}" \
+          --model_fa "{input.model}" \
+          --out "{output}" \
+          --target_prefix "Target|" \
+          --model_prefix "Model|"
+        test -s "{output}"
+        """
+
+rule phylo_mafft:
+    input:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.pep.fa"
+    output:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.aln.fa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        {MAFFT_BIN} --auto --thread {threads} "{input}" > "{output}"
+        test -s "{output}"
+        """
+
+rule phylo_trim:
+    input:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.aln.fa"
+    output:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.aln.trim.fa"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(PHYLO_ENABLE_TRIM).lower()}"
+        MODE="{PHYLO_TRIMAL_MODE}"
+
+        if [[ "$ENABLE" != "true" ]]; then
+          cp "{input}" "{output}"
+        else
+          if [[ "$MODE" == "automated1" ]]; then
+            command -v {TRIMAL} >/dev/null 2>&1 || (echo "[ERROR] trimal not found in PATH" && exit 1)
+            {TRIMAL} -in "{input}" -out "{output}" -automated1
+          else
+            cp "{input}" "{output}"
+          fi
+        fi
+        test -s "{output}"
+        """
+
+rule phylo_iqtree:
+    input:
+        aln=f"{OUT}/08.phylogeny/{FAMILY}_combined.aln.trim.fa"
+    output:
+        tree=f"{OUT}/08.phylogeny/{FAMILY}.treefile"
+    threads: THREADS
+    params:
+        model=lambda wc: config.get("phylo", {}).get("iqtree_model", "MFP"),
+        boot=lambda wc: int(config.get("phylo", {}).get("bootstrap", 1000)),
+        alrt=lambda wc: int(config.get("phylo", {}).get("alrt", 1000))
+    shell:
+        r"""
+        set -euo pipefail
+        command -v {IQTREE2} >/dev/null 2>&1 || (echo "[ERROR] iqtree2 not found in PATH" && exit 1)
+
+        CORES=$("{PY}" - <<'PY'
+import os
+try:
+    print(len(os.sched_getaffinity(0)))
+except Exception:
+    print(1)
+PY
+)
+        if [ -z "$CORES" ] || [ "$CORES" -lt 1 ]; then CORES=$(nproc 2>/dev/null || echo 1); fi
+        T=$(( {threads} < CORES ? {threads} : CORES ))
+        [ "$T" -ge 1 ] || T=1
+
+        mkdir -p "{OUT}/08.phylogeny"
+        {IQTREE2} -s "{input.aln}" \
+          -m "{params.model}" \
+          -B "{params.boot}" \
+          --alrt "{params.alrt}" \
+          -T $T \
+          -pre "{OUT}/08.phylogeny/{FAMILY}"
+
+        test -s "{output.tree}"
+        """
+
+rule phylo_plot:
+    input:
+        tree=f"{OUT}/08.phylogeny/{FAMILY}.treefile"
+    output:
+        f"{OUT}/99.result/{FAMILY}_PhyloTree.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{OUT}/99.result"
+        {RSCRIPT} "{PROJ_SCRIPTS}/plot_tree.R" \
+          --tree "{input.tree}" \
+          --family "{FAMILY}" \
+          --out "{output}"
+        test -s "{output}"
+        """
+
+# =========================
+# Module 9: Ka/Ks for family paralogs (optional)
+# =========================
+rule kaks_pairs_from_family:
+    input:
+        genes=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        KAKS_PAIRS
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          echo -e "geneA\tgeneB\ttype" > "{output}"
+          exit 0
+        fi
+        mkdir -p "{KAKS_OUTDIR}"
+        "{PY}" "{PROJ_SCRIPTS}/kaks_pairs_from_list.py" \
+          --gene_list "{input.genes}" \
+          --out "{output}"
+        test -s "{output}"
+        """
+
+rule kaks_build_axt:
+    input:
+        pairs=KAKS_PAIRS,
+        cds=f"{OUT}/01.cds_protein/target.cds.longest.fa"
+    output:
+        directory(f"{KAKS_OUTDIR}/axt")
+    threads: 6
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          mkdir -p "{KAKS_OUTDIR}/axt"
+          exit 0
+        fi
+
+        mkdir -p "{KAKS_OUTDIR}/axt"
+
+        if [ ! -x "{KAKS_BIN_DIR}/AXTConvertor" ]; then
+          echo "[ERROR] AXTConvertor not executable: {KAKS_BIN_DIR}/AXTConvertor" >&2
+          exit 1
+        fi
+        if [ ! -f "{PAL2NAL}" ]; then
+          echo "[ERROR] pal2nal.pl not found: {PAL2NAL}" >&2
+          exit 1
+        fi
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_make_axt_batch.py" \
+          --pairs "{input.pairs}" \
+          --cds_fa "{input.cds}" \
+          --outdir "{KAKS_OUTDIR}/axt" \
+          --mafft "{MAFFT}" \
+          --pal2nal "{PAL2NAL}" \
+          --axtconvertor "{KAKS_BIN_DIR}/AXTConvertor" \
+          --threads {threads}
+        """
+
+rule kaks_run:
+    input:
+        axt_dir=f"{KAKS_OUTDIR}/axt"
+    output:
+        raw=KAKS_RAW
+    threads: 6
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          mkdir -p "{KAKS_OUTDIR}/kaks"
+          echo -e "seq1\tseq2\tKa\tKs\tKa/Ks\tP-Value\tMethod\tModel\tSubstitutions\tLength" > "{output.raw}"
+          exit 0
+        fi
+
+        mkdir -p "{KAKS_OUTDIR}/kaks"
+        if [ ! -x "{KAKS_BIN_DIR}/KaKs" ]; then
+          echo "[ERROR] KaKs not executable: {KAKS_BIN_DIR}/KaKs" >&2
+          exit 1
+        fi
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_run_batch.py" \
+          --axt_dir "{input.axt_dir}" \
+          --kaks "{KAKS_BIN_DIR}/KaKs" \
+          --method "{KAKS_METHOD}" \
+          --out "{output.raw}" \
+          --threads {threads}
+
+        test -s "{output.raw}"
+        """
+
+rule kaks_filter:
+    input:
+        raw=KAKS_RAW,
+        pairs=KAKS_PAIRS
+    output:
+        KAKS_FILT
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          echo -e "geneA\tgeneB\ttype\tKa\tKs\tw\tmethod" > "{output}"
+          exit 0
+        fi
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_filter.py" \
+          --kaks_raw "{input.raw}" \
+          --pairs "{input.pairs}" \
+          --min_ks {KAKS_MIN_KS} \
+          --max_ks {KAKS_MAX_KS} \
+          --max_w {KAKS_MAX_W} \
+          --out "{output}"
+        test -s "{output}"
+        """
+
+rule plot_kaks:
+    input:
+        kaks=KAKS_FILT
+    output:
+        ks=f"{OUT}/99.result/Ks_distribution.pdf",
+        w=f"{OUT}/99.result/KaKs_distribution.pdf",
+        scatter=f"{OUT}/99.result/Ka_vs_Ks_scatter.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(KAKS_ENABLE).lower()}"
+        mkdir -p "{OUT}/99.result"
+        if [[ "$ENABLE" != "true" ]]; then
+          {RSCRIPT} -e "pdf('{output.ks}'); plot.new(); text(0.5,0.5,'Ka/Ks disabled'); dev.off()"
+          {RSCRIPT} -e "pdf('{output.w}'); plot.new(); text(0.5,0.5,'Ka/Ks disabled'); dev.off()"
+          {RSCRIPT} -e "pdf('{output.scatter}'); plot.new(); text(0.5,0.5,'Ka/Ks disabled'); dev.off()"
+          exit 0
+        fi
+
+        {RSCRIPT} "{PROJ_SCRIPTS}/plot_kaks.R" \
+          --kaks_tsv "{input.kaks}" \
+          --out_ks "{output.ks}" \
+          --out_w "{output.w}" \
+          --out_scatter "{output.scatter}"
+
+        test -s "{output.ks}"
+        test -s "{output.w}"
+        test -s "{output.scatter}"
+        """
+
+# =========================
+# Module 10: Whole-genome self syntenic Ks background (optional; depends on KaKs)
+# =========================
+rule syk_mcscanx_gff:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa"
+    output:
+        gff=f"{SYK_PREFIX}.gff"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYK_ENABLE and KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          mkdir -p "{SYK_MCS_DIR}"
+          echo -n "" > "{output.gff}"
+          exit 0
+        fi
+
+        mkdir -p "{SYK_MCS_DIR}"
+
+        grep '^>' "{input.pep}" | sed 's/^>//; s/[[:space:]].*$//' | sort -u > "{SYK_PREFIX}.pep.ids"
+
+        awk 'BEGIN{FS="\t"; OFS="\t"}
+             NR==FNR{ok[$1]=1; next}
+             $0!~/^#/ && ($3=="mRNA" || $3=="transcript") {
+               id="";
+               if (match($9,/ID=([^;]+)/,a)) id=a[1];
+               if (id!="" && (id in ok)) {
+                 print $1, id, $4, $5
+               }
+             }' "{SYK_PREFIX}.pep.ids" "{input.gff}" \
+          | sort -k1,1 -k3,3n > "{output.gff}"
+
+        rm -f "{SYK_PREFIX}.pep.ids"
+        test -s "{output.gff}"
+        """
+
+rule syk_self_blast:
+    input:
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa"
+    output:
+        blast=f"{SYK_PREFIX}.blast"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYK_ENABLE and KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          mkdir -p "{SYK_MCS_DIR}"
+          echo -n "" > "{output.blast}"
+          exit 0
+        fi
+
+        mkdir -p "{SYK_MCS_DIR}"
+        command -v {DIAMOND} >/dev/null 2>&1 || (echo "[ERROR] diamond not found in PATH" && exit 1)
+
+        {DIAMOND} makedb --in "{input.pep}" -d "{SYK_PREFIX}" --quiet
+
+        {DIAMOND} blastp \
+          -q "{input.pep}" -d "{SYK_PREFIX}" \
+          -o "{output.blast}" \
+          -f 6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore \
+          -e "{SYK_EVALUE}" \
+          --max-target-seqs "{SYK_MTS}" \
+          --threads {threads}
+
+        test -s "{output.blast}"
+        """
+
+rule syk_run_mcscanx:
+    input:
+        gff=f"{SYK_PREFIX}.gff",
+        blast=f"{SYK_PREFIX}.blast"
+    output:
+        col=f"{SYK_PREFIX}.collinearity"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYK_ENABLE and KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          mkdir -p "{SYK_MCS_DIR}"
+          echo -n "" > "{output.col}"
+          exit 0
+        fi
+
+        command -v {MCSCANX} >/dev/null 2>&1 || (echo "[ERROR] MCScanX not found in PATH" && exit 1)
+
+        cd "{SYK_MCS_DIR}"
+        {MCSCANX} "{TARGET}_self"
+
+        test -s "{TARGET}_self.collinearity"
+        """
+
+rule syk_pairs_from_collinearity:
+    input:
+        col=SYK_COL
+    output:
+        SYK_PAIRS
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYK_ENABLE and KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          mkdir -p "{SYK_OUTDIR}"
+          echo -e "geneA\tgeneB\ttype" > "{output}"
+          exit 0
+        fi
+
+        mkdir -p "{SYK_OUTDIR}"
+        "{PY}" "{PROJ_SCRIPTS}/parse_mcscanx_collinearity_to_pairs.py" \
+          --collinearity "{input.col}" \
+          --out "{output}" \
+          --min_block_hits 5
+        test -s "{output}"
+        """
+
+rule syk_build_axt:
+    input:
+        pairs=SYK_PAIRS,
+        cds=f"{OUT}/01.cds_protein/target.cds.longest.fa"
+    output:
+        directory(f"{SYK_OUTDIR}/axt")
+    threads: 6
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYK_ENABLE and KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          mkdir -p "{SYK_OUTDIR}/axt"
+          exit 0
+        fi
+
+        mkdir -p "{SYK_OUTDIR}/axt"
+
+        if [ ! -x "{KAKS_BIN_DIR}/AXTConvertor" ]; then
+          echo "[ERROR] AXTConvertor not executable: {KAKS_BIN_DIR}/AXTConvertor" >&2
+          exit 1
+        fi
+        if [ ! -f "{PAL2NAL}" ]; then
+          echo "[ERROR] pal2nal.pl not found: {PAL2NAL}" >&2
+          exit 1
+        fi
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_make_axt_batch.py" \
+          --pairs "{input.pairs}" \
+          --cds_fa "{input.cds}" \
+          --outdir "{SYK_OUTDIR}/axt" \
+          --mafft "{MAFFT}" \
+          --pal2nal "{PAL2NAL}" \
+          --axtconvertor "{KAKS_BIN_DIR}/AXTConvertor" \
+          --threads {threads}
+        """
+
+rule syk_run_kaks:
+    input:
+        axt_dir=f"{SYK_OUTDIR}/axt"
+    output:
+        raw=SYK_RAW
+    threads: 6
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYK_ENABLE and KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          mkdir -p "{SYK_OUTDIR}/kaks"
+          echo -e "seq1\tseq2\tKa\tKs\tKa/Ks\tP-Value\tMethod\tModel\tSubstitutions\tLength" > "{output.raw}"
+          exit 0
+        fi
+
+        mkdir -p "{SYK_OUTDIR}/kaks"
+        if [ ! -x "{KAKS_BIN_DIR}/KaKs" ]; then
+          echo "[ERROR] KaKs not executable: {KAKS_BIN_DIR}/KaKs" >&2
+          exit 1
+        fi
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_run_batch.py" \
+          --axt_dir "{input.axt_dir}" \
+          --kaks "{KAKS_BIN_DIR}/KaKs" \
+          --method "{KAKS_METHOD}" \
+          --out "{output.raw}" \
+          --threads {threads}
+
+        test -s "{output.raw}"
+        """
+
+rule syk_filter:
+    input:
+        raw=SYK_RAW,
+        pairs=SYK_PAIRS
+    output:
+        SYK_FILT
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYK_ENABLE and KAKS_ENABLE).lower()}"
+        if [[ "$ENABLE" != "true" ]]; then
+          echo -e "geneA\tgeneB\ttype\tKa\tKs\tw\tmethod" > "{output}"
+          exit 0
+        fi
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_filter.py" \
+          --kaks_raw "{input.raw}" \
+          --pairs "{input.pairs}" \
+          --min_ks {SYK_MIN_KS} \
+          --max_ks {SYK_MAX_KS} \
+          --max_w {SYK_MAX_W} \
+          --out "{output}"
+        test -s "{output}"
+        """
+
+rule plot_family_vs_syntenic_ks:
+    input:
+        fam=f"{OUT}/09.selection/kaks/kaks.filtered.tsv",
+        syn=SYK_FILT
+    output:
+        pdf=f"{OUT}/99.result/Ks_family_vs_syntenic.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        ENABLE="{str(SYK_ENABLE and KAKS_ENABLE).lower()}"
+        mkdir -p "{OUT}/99.result"
+        if [[ "$ENABLE" != "true" ]]; then
+          {RSCRIPT} -e "pdf('{output.pdf}'); plot.new(); text(0.5,0.5,'syntenic_kaks disabled'); dev.off()"
+          exit 0
+        fi
+
+        {RSCRIPT} "{PROJ_SCRIPTS}/plot_family_vs_syntenic_Ks.R" \
+          --family_kaks "{input.fam}" \
+          --syntenic_kaks "{input.syn}" \
+          --family_name "{FAMILY}" \
+          --xmax 5 \
+          --out_pdf "{output.pdf}"
+
+        test -s "{output.pdf}"
+        """

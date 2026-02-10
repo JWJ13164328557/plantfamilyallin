@@ -1,0 +1,38 @@
+name: plantfamilyallin
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - snakemake>=7
+
+  # 关键：用 bioconda 的 jcvi（不要 pip）
+  - jcvi
+
+  # 其它工具（按你流程需要）
+  - gffread
+  - agat
+  - bedtools
+  - samtools
+  - diamond
+  - hmmer
+  - mafft
+  - meme
+  - iqtree
+  - trimal
+
+  # R 画图
+  - r-base
+  - r-ggplot2
+  - r-dplyr
+  - r-tidyr
+  - r-readr
+  - r-ggvenndiagram
+  - r-ape
+  - bioconductor-ggtree
+  - bioconductor-treeio
+
+  # Python
+  - biopython
+  - pyyaml

@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+
+
+def infer_env_prefix_from_self() -> str:
+    """
+    Infer conda env prefix from this script location.
+
+    Expected layout:
+      <ENV_PREFIX>/plantfamily/plantfamilyallin   (this file)
+      <ENV_PREFIX>/bin/snakemake
+    """
+    self_path = os.path.abspath(__file__)
+    # .../envs/plantfamilyallin/plantfamily/plantfamilyallin -> go up 2 levels
+    env_prefix = os.path.dirname(os.path.dirname(self_path))
+    return env_prefix
+
+
+def _parse_config_loose(config_path: str) -> dict:
+    """
+    Try to read config.txt in a tolerant way.
+    Supports:
+      - YAML (if PyYAML available)
+      - JSON
+      - simple "key: value" / "key=value" lines
+    """
+    if not os.path.exists(config_path):
+        return {}
+
+    # 1) YAML (best)
+    try:
+        import yaml  # type: ignore
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+
+    # 2) JSON
+    try:
+        import json
+        with open(config_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+
+    # 3) key=value / key: value
+    out = {}
+    with open(config_path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+            elif ":" in line:
+                k, v = line.split(":", 1)
+            else:
+                continue
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            out[k] = v
+    return out
+
+
+def _get_runner_env_prefix(cfg: dict) -> str:
+    """
+    Read runner_env_prefix from config in these forms:
+      1) runner_env_prefix: /path/to/env
+      2) runner: { env_prefix: /path/to/env }
+    """
+    if not isinstance(cfg, dict):
+        return ""
+
+    v = cfg.get("runner_env_prefix", "")
+    if isinstance(v, str) and v.strip():
+        return v.strip()
+
+    runner = cfg.get("runner", {})
+    if isinstance(runner, dict):
+        v2 = runner.get("env_prefix", "")
+        if isinstance(v2, str) and v2.strip():
+            return v2.strip()
+
+    return ""
+
+
+def resolve_snakemake(forced_prefix: str = "") -> str:
+    """
+    HARD preference order:
+      1) <forced_prefix>/bin/snakemake   (from config)
+      2) <ENV_PREFIX>/bin/snakemake      (inferred from this script path)
+      3) $CONDA_PREFIX/bin/snakemake
+      4) next to current python: dirname(sys.executable)/snakemake
+      5) PATH (shutil.which)
+    """
+    # 1) forced by config
+    if forced_prefix:
+        cand = os.path.join(forced_prefix, "bin", "snakemake")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+        raise SystemExit(f"ERROR: runner_env_prefix set but snakemake not found/executable: {cand}")
+
+    # 2) infer from script location
+    env_prefix = infer_env_prefix_from_self()
+    cand = os.path.join(env_prefix, "bin", "snakemake")
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+
+    # 3) CONDA_PREFIX
+    conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    if conda_prefix:
+        cand = os.path.join(conda_prefix, "bin", "snakemake")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+
+    # 4) next to current python
+    cand = os.path.join(os.path.dirname(sys.executable), "snakemake")
+    if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        return cand
+
+    # 5) PATH
+    cand = shutil.which("snakemake")
+    if cand:
+        return cand
+
+    raise SystemExit("ERROR: snakemake not found (forced_prefix, env_prefix/bin, CONDA_PREFIX/bin, sys.executable dir, or PATH)")
+
+
+def _prepare_subprocess_env(forced_prefix: str = "") -> dict:
+    """
+    If forced_prefix is set, also force PATH + CONDA_PREFIX for the snakemake process,
+    so shell rules that call 'python'/'perl' will prefer that env.
+    """
+    env = os.environ.copy()
+    if forced_prefix:
+        env["CONDA_PREFIX"] = forced_prefix
+        env["PATH"] = os.path.join(forced_prefix, "bin") + os.pathsep + env.get("PATH", "")
+        # optional: reduce perl pollution
+        env.pop("PERL5LIB", None)
+        env.pop("PERL5OPT", None)
+        env.pop("PERL_LOCAL_LIB_ROOT", None)
+        env.pop("PERL_MB_OPT", None)
+        env.pop("PERL_MM_OPT", None)
+    return env
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="plantfamilyallin wrapper for snakemake (can force env by config.txt: runner_env_prefix)"
+    )
+    ap.add_argument("-c", "--configfile", required=True, help="config.txt 路径（snakemake configfile）")
+    ap.add_argument("--snakefile", required=True, help="Snakefile 路径")
+    ap.add_argument("-j", "--jobs", type=int, default=10, help="并行线程数 (snakemake -j)")
+    ap.add_argument("--rerun-incomplete", action="store_true", help="snakemake --rerun-incomplete")
+    ap.add_argument("--use-conda", action="store_true", help="snakemake --use-conda")
+    ap.add_argument("-p", "--printshellcmds", action="store_true", help="snakemake -p/--printshellcmds")
+    ap.add_argument("--reason", action="store_true", help="snakemake --reason")
+    ap.add_argument("--dry-run", "-n", action="store_true", help="snakemake -n")
+    ap.add_argument("extra", nargs=argparse.REMAINDER, help="传递给 snakemake 的额外参数（放在 -- 之后）")
+    args = ap.parse_args()
+
+    cfg = _parse_config_loose(args.configfile)
+    forced_prefix = _get_runner_env_prefix(cfg)
+
+    snk = resolve_snakemake(forced_prefix=forced_prefix)
+    env = _prepare_subprocess_env(forced_prefix=forced_prefix)
+
+    cmd = [
+        snk,
+        "--snakefile", args.snakefile,
+        "--configfile", args.configfile,
+        "-j", str(args.jobs),
+    ]
+
+    if args.printshellcmds:
+        cmd.append("-p")
+    if args.reason:
+        cmd.append("--reason")
+    if args.use_conda:
+        cmd.append("--use-conda")
+    if args.rerun_incomplete:
+        cmd.append("--rerun-incomplete")
+    if args.dry_run:
+        cmd.append("-n")
+
+    extra = args.extra
+    if extra and extra[0] == "--":
+        extra = extra[1:]
+    cmd.extend(extra)
+
+    # Debug prints (helpful for env mix issues)
+    print(f"[plantfamilyallin] self           = {os.path.abspath(__file__)}", file=sys.stderr)
+    print(f"[plantfamilyallin] sys.executable  = {sys.executable}", file=sys.stderr)
+    print(f"[plantfamilyallin] configfile      = {args.configfile}", file=sys.stderr)
+    print(f"[plantfamilyallin] runner_env_prefix= {forced_prefix}", file=sys.stderr)
+    print(f"[plantfamilyallin] snakemake        = {snk}", file=sys.stderr)
+    print(f"[plantfamilyallin] CONDA_PREFIX(sub)= {env.get('CONDA_PREFIX','')}", file=sys.stderr)
+    print(f"[plantfamilyallin] cmd             = {' '.join(cmd)}", file=sys.stderr)
+
+    subprocess.run(cmd, check=True, env=env)
+
+
+if __name__ == "__main__":
+    main()

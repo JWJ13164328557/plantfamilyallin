@@ -1,0 +1,1375 @@
+import os
+import sys
+from pathlib import Path
+
+PROJDIR = Path(workflow.snakefile).resolve().parent
+PROJ_SCRIPTS = str(PROJDIR / "scripts")
+
+OUT = config["outdir"]
+THREADS = int(config.get("threads", 10))
+
+FAMILY = config["family_name"]
+PFAM_IDS = ",".join(config["pfam_domains_of_interest"])
+TARGET = config["target"]["name"]
+T_GENOME = config["target"]["genome_fa"]
+T_GFF = config["target"]["gff3"]
+
+MODEL_PEP = config["model_family_pep"]
+PFAM_HMM = config["pfam_hmm"]
+FAMILY_HMM = config.get("family_hmm", "")
+
+PROMOTER_LEN = int(config.get("promoter_len", 3000))
+FINAL_STRATEGY = config.get("final_strategy", "intersection")
+
+SYNTENY = config.get("synteny_species", [])
+SYNT_NAMES = [s["name"] for s in SYNTENY]
+
+# python used by snakemake main process
+PY = sys.executable
+
+# ---- force use conda Rscript if available ----
+_CONDA_PREFIX = os.environ.get("CONDA_PREFIX", "")
+if _CONDA_PREFIX:
+    _r = Path(_CONDA_PREFIX) / "bin" / "Rscript"
+    RSCRIPT = str(_r) if _r.exists() else "Rscript"
+else:
+    RSCRIPT = "Rscript"
+
+rule all:
+    input:
+        # 模块1
+        f"{OUT}/01.cds_protein/target.pep.longest.fa",
+        f"{OUT}/01.cds_protein/target.cds.longest.fa",
+
+        # 模块2
+        f"{OUT}/02.family_id/blast_candidates.list",
+        f"{OUT}/02.family_id/pfam_candidates.list",
+        f"{OUT}/02.family_id/hmm_candidates.list",
+        f"{OUT}/02.family_id/final_family_members.list",
+        f"{OUT}/99.result/{FAMILY}_Venn.pdf",
+
+        # 模块3
+        f"{OUT}/03.chromosome_map/family_genes.bed",
+        f"{OUT}/99.result/{FAMILY}_ChrMap.pdf",
+
+        # 模块4
+        f"{OUT}/04.meme_structure/meme_out/meme.html",
+        f"{OUT}/04.meme_structure/meme_out/domain.tsv",
+        f"{OUT}/04.meme_structure/meme_out/gene_structure.tsv",
+
+        # 模块4（新增）
+        f"{OUT}/99.result/{FAMILY}_MotifTree.pdf",
+
+        # 模块5
+        f"{OUT}/05.promoter_cis/family_promoter_{PROMOTER_LEN}bp.fa",
+
+        # 模块6
+        f"{OUT}/06.protein_property/{FAMILY}_protein_properties.csv",
+
+        # 模块7
+        f"{OUT}/07.synteny/genomes.tsv",
+        f"{OUT}/07.synteny/genespace/genespace.gsParam.rds",
+        f"{OUT}/99.result/GENESPACE_riparian.pdf",
+
+        # 模块8
+        f"{OUT}/08.phylogeny/{FAMILY}.treefile",
+        f"{OUT}/99.result/{FAMILY}_PhyloTree.pdf",
+       
+         # 模块9（Ka/Ks + Ks分布）
+        f"{OUT}/09.selection/kaks/kaks.filtered.tsv",
+        f"{OUT}/99.result/Ks_distribution.pdf",
+        f"{OUT}/99.result/KaKs_distribution.pdf",
+        f"{OUT}/99.result/Ka_vs_Ks_scatter.pdf",
+        f"{OUT}/99.result/Ks_family_vs_syntenic.pdf"
+
+
+
+
+# =========================
+# 模块1：GFF清洗 + 越界过滤 + CDS/蛋白提取 + 最长转录本
+# =========================
+rule agat_clean_gff:
+    input:
+        T_GFF
+    output:
+        f"{OUT}/01.cds_protein/annotation.clean.gff3"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/01.cds_protein
+        agat_convert_sp_gff2gff3.pl -g {input} -o {output}
+        """
+
+
+rule filter_oob_target_gff:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.gff3",
+        genome=T_GENOME
+    output:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        kill=f"{OUT}/01.cds_protein/out_of_bounds.kill.txt"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+
+        samtools faidx {input.genome}
+
+        awk 'BEGIN{{FS="\t"}}
+             NR==FNR{{len[$1]=$2; next}}
+             ($1 in len) && ($4<1 || $5>len[$1]) {{
+                 if (match($9,/Parent=([^;]+)/,a)) {{
+                     n=split(a[1],p,","); for(i=1;i<=n;i++) print p[i];
+                 }} else if (match($9,/ID=([^;]+)/,b)) {{
+                     print b[1];
+                 }}
+             }}' {input.genome}.fai {input.gff} | sort -u > {output.kill}
+
+        if [ -s {output.kill} ]; then
+            PREFIX="$(cd "$(dirname "$(command -v agat_convert_sp_gff2gff3.pl)")/.." && pwd)"
+            PERL="$PREFIX/bin/perl"
+            FILTER="$PREFIX/bin/agat_sp_filter_feature_from_kill_list.pl"
+            env -u PERL5LIB -u PERL5OPT -u PERL_LOCAL_LIB_ROOT -u PERL_MB_OPT -u PERL_MM_OPT \
+              "$PERL" "$FILTER" \
+                --gff {input.gff} \
+                --kill_list {output.kill} \
+                --output {output.gff}
+        else
+            cp {input.gff} {output.gff}
+        fi
+        """
+
+
+rule extract_cds_pep:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        genome=T_GENOME
+    output:
+        cds=f"{OUT}/01.cds_protein/target.cds.fa",
+        pep=f"{OUT}/01.cds_protein/target.pep.fa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        gffread {input.gff} -g {input.genome} -x {output.cds}
+        gffread {input.gff} -g {input.genome} -y {output.pep}
+        """
+
+
+rule longest_isoform:
+    input:
+        cds=f"{OUT}/01.cds_protein/target.cds.fa",
+        pep=f"{OUT}/01.cds_protein/target.pep.fa"
+    output:
+        cds=f"{OUT}/01.cds_protein/target.cds.longest.fa",
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa",
+        map=f"{OUT}/01.cds_protein/longest_isoform_map.tsv"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/gff_longest_isoform.py" \
+          --cds {input.cds} --pep {input.pep} \
+          --out_cds {output.cds} --out_pep {output.pep} \
+          --out_map {output.map}
+        """
+
+
+# =========================
+# 模块2：BLAST + Pfam + 家族HMM + Venn + 最终成员
+# =========================
+rule diamond_db:
+    input:
+        f"{OUT}/01.cds_protein/target.pep.longest.fa"
+    output:
+        f"{OUT}/02.family_id/target.dmnd"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/02.family_id
+        diamond makedb --in {input} -d {OUT}/02.family_id/target
+        """
+
+
+rule blast_model_vs_target:
+    input:
+        dmnd=f"{OUT}/02.family_id/target.dmnd",
+        query=MODEL_PEP
+    output:
+        tsv=f"{OUT}/02.family_id/blast_model_vs_target.tsv"
+    threads: THREADS
+    params:
+        evalue=config["blast"]["evalue"],
+        max_target_seqs=config["blast"]["max_target_seqs"]
+    shell:
+        r"""
+        set -euo pipefail
+        diamond blastp \
+          -q {input.query} \
+          -d {OUT}/02.family_id/target \
+          -o {output.tsv} \
+          -f 6 qseqid sseqid pident length qlen slen qstart qend sstart send evalue bitscore \
+          -e {params.evalue} \
+          --max-target-seqs {params.max_target_seqs} \
+          --threads {threads}
+        """
+
+
+rule blast_candidates:
+    input:
+        f"{OUT}/02.family_id/blast_model_vs_target.tsv"
+    output:
+        f"{OUT}/02.family_id/blast_candidates.list"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/list_ops.py" blast_candidates \
+          --blast_tsv {input} \
+          --out {output}
+        """
+
+
+rule pfam_scan:
+    input:
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa"
+    output:
+        domtbl=f"{OUT}/02.family_id/pfam.domtblout",
+        log=f"{OUT}/02.family_id/pfam.hmmscan.log"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/02.family_id
+
+        PFAM="{PFAM_HMM}"
+
+        # 如果索引不完整（缺任意一个），就先删掉旧索引再 hmmpress
+        missing=0
+        for ext in h3f h3i h3m h3p; do
+          [ -f "${{PFAM}}.${{ext}}" ] || missing=1
+        done
+
+        if [ $missing -eq 1 ]; then
+          rm -f "${{PFAM}}.h3f" "${{PFAM}}.h3i" "${{PFAM}}.h3m" "${{PFAM}}.h3p"
+          hmmpress "${{PFAM}}"
+        fi
+
+        hmmscan --cpu {threads} --domtblout {output.domtbl} "${{PFAM}}" {input.pep} > {output.log}
+        """
+
+
+rule pfam_candidates:
+    input:
+        domtbl=f"{OUT}/02.family_id/pfam.domtblout"
+    output:
+        f"{OUT}/02.family_id/pfam_candidates.list"
+    threads: THREADS
+    params:
+        pfam_ids=PFAM_IDS
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/parse_domtblout_pfam.py" \
+          --domtbl {input.domtbl} \
+          --pfam_ids "{params.pfam_ids}" \
+          --out {output}
+        """
+
+
+rule build_family_hmm_if_needed:
+    input:
+        MODEL_PEP
+    output:
+        hmm=f"{OUT}/02.family_id/family.hmm"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mafft --auto --thread {threads} {input} > {OUT}/02.family_id/model_family.aln.fa
+        hmmbuild {output.hmm} {OUT}/02.family_id/model_family.aln.fa
+        """
+
+
+rule hmm_search:
+    input:
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa",
+        hmm=lambda wc: FAMILY_HMM if FAMILY_HMM else f"{OUT}/02.family_id/family.hmm"
+    output:
+        domtbl=f"{OUT}/02.family_id/hmm.domtblout",
+        log=f"{OUT}/02.family_id/hmmsearch.log"
+    threads: THREADS
+    params:
+        evalue=config["hmm"]["evalue"]
+    shell:
+        r"""
+        set -euo pipefail
+        hmmsearch --cpu {threads} --domtblout {output.domtbl} -E {params.evalue} {input.hmm} {input.pep} > {output.log}
+        """
+
+
+rule hmm_candidates:
+    input:
+        f"{OUT}/02.family_id/hmm.domtblout"
+    output:
+        f"{OUT}/02.family_id/hmm_candidates.list"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/parse_domtblout_hmm.py" --domtbl {input} --out {output}
+        """
+
+
+rule final_members:
+    input:
+        blast=f"{OUT}/02.family_id/blast_candidates.list",
+        pfam=f"{OUT}/02.family_id/pfam_candidates.list",
+        hmm=f"{OUT}/02.family_id/hmm_candidates.list"
+    output:
+        out_list=f"{OUT}/02.family_id/final_family_members.list",
+        venn_tsv=f"{OUT}/02.family_id/venn_input.tsv"
+    threads: THREADS
+    params:
+        strategy=FINAL_STRATEGY
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/list_ops.py" final_members \
+          --blast {input.blast} --pfam {input.pfam} --hmm {input.hmm} \
+          --strategy {params.strategy} \
+          --out_list {output.out_list} \
+          --out_venn_tsv {output.venn_tsv}
+        """
+
+
+rule plot_venn:
+    input:
+        f"{OUT}/02.family_id/venn_input.tsv"
+    output:
+        f"{OUT}/99.result/{FAMILY}_Venn.pdf"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/99.result
+        {RSCRIPT} {PROJ_SCRIPTS}/plot_venn.R \
+          --venn_tsv {input} \
+          --family "{FAMILY}" \
+          --out {output}
+        """
+
+
+# =========================
+# 模块3：家族成员染色体定位图
+# =========================
+rule faidx:
+    input:
+        T_GENOME
+    output:
+        f"{OUT}/03.chromosome_map/chr.length"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/03.chromosome_map
+        samtools faidx {input}
+        cut -f1,2 {input}.fai > {output}
+        """
+
+
+rule extract_family_bed:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        genes=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        f"{OUT}/03.chromosome_map/family_genes.bed"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/03.chromosome_map
+
+        awk 'BEGIN{{FS="\t"; OFS="\t"}}
+             NR==FNR{{keep[$1]=1; next}}
+             $0!~/^#/ && ($3=="mRNA" || $3=="transcript") {{
+                id=""
+                if (match($9,/ID=([^;]+)/,a)) id=a[1]
+                if (id!="" && (id in keep)) {{
+                   s=$4-1; if (s<0) s=0
+                   print $1, s, $5, id, 0, $7
+                }}
+             }}' {input.genes} {input.gff} \
+          | sort -k1,1 -k2,2n > {output}
+        """
+
+
+rule plot_chr_map:
+    input:
+        bed=f"{OUT}/03.chromosome_map/family_genes.bed",
+        chrlen=f"{OUT}/03.chromosome_map/chr.length"
+    output:
+        f"{OUT}/99.result/{FAMILY}_ChrMap.pdf"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/99.result
+        {RSCRIPT} {PROJ_SCRIPTS}/plot_chr_map.R \
+          --bed {input.bed} \
+          --chrlen {input.chrlen} \
+          --family "{FAMILY}" \
+          --out {output}
+        """
+
+
+# =========================
+# 模块4：提取家族蛋白 + MEME motif
+# =========================
+rule extract_family_pep:
+    input:
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa",
+        genes=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        f"{OUT}/04.meme_structure/final_family.pep.fa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/04.meme_structure
+        "{PY}" "{PROJ_SCRIPTS}/list_ops.py" extract_fasta \
+          --fasta {input.pep} --ids {input.genes} --out {output}
+        """
+
+
+rule meme_run:
+    input:
+        f"{OUT}/04.meme_structure/final_family.pep.fa"
+    output:
+        html=f"{OUT}/04.meme_structure/meme_out/meme.html",
+        txt=f"{OUT}/04.meme_structure/meme_out/meme.txt",
+        xml=f"{OUT}/04.meme_structure/meme_out/meme.xml"
+    threads: THREADS
+    params:
+        nmotifs=config["meme"]["nmotifs"],
+        minw=config["meme"]["minw"],
+        maxw=config["meme"]["maxw"],
+        mod=config["meme"]["mod"]
+    shell:
+        r"""
+        set -euo pipefail
+        meme {input} -oc {OUT}/04.meme_structure/meme_out \
+          -protein -mod {params.mod} -nmotifs {params.nmotifs} -minw {params.minw} -maxw {params.maxw}
+
+        test -s {output.txt}
+        test -s {output.xml}
+        test -s {output.html}
+        """
+
+
+# =========================
+# 模块4增强-2：Domain track (Pfam domtblout -> domain.tsv)
+# =========================
+rule pfam_domain_tsv:
+    input:
+        domtbl=f"{OUT}/02.family_id/pfam.domtblout",
+        fam=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        tsv=f"{OUT}/04.meme_structure/meme_out/domain.tsv"
+    threads: THREADS
+    params:
+        pfam_keep=PFAM_IDS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/04.meme_structure/meme_out
+
+        "{PY}" "{PROJ_SCRIPTS}/domtblout_to_domain_tsv.py" \
+          --domtbl {input.domtbl} \
+          --out {output.tsv} \
+          --only_pfam "{params.pfam_keep}" \
+          --min_iE 1e-3
+
+        awk 'BEGIN{{FS=OFS="\t"}} NR==FNR{{keep[$1]=1;next}} NR==1 || ($1 in keep)' \
+          {input.fam} {output.tsv} > {output.tsv}.tmp
+        mv {output.tsv}.tmp {output.tsv}
+        """
+
+
+# =========================
+# 模块4增强-3：Gene structure track (GFF3 -> gene_structure.tsv)
+# =========================
+rule gene_structure_tsv:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        fam=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        tsv=f"{OUT}/04.meme_structure/meme_out/gene_structure.tsv"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/04.meme_structure/meme_out
+        "{PY}" "{PROJ_SCRIPTS}/gff3_to_gene_structure_tsv.py" \
+          --gff {input.gff} \
+          --ids {input.fam} \
+          --out {output.tsv} \
+          --features "exon,CDS,five_prime_UTR,three_prime_UTR,UTR"
+        """
+
+
+# =========================
+# 模块4增强：家族成员树 + MEME motif 结构可视化（类似示例图）
+# =========================
+rule meme_tree_mafft:
+    input:
+        pep=f"{OUT}/04.meme_structure/final_family.pep.fa"
+    output:
+        aln=f"{OUT}/04.meme_structure/final_family.pep.aln.fa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mafft --auto --thread {threads} {input.pep} > {output.aln}
+        """
+
+
+rule meme_tree_iqtree_quick:
+    input:
+        aln=f"{OUT}/04.meme_structure/final_family.pep.aln.fa"
+    output:
+        tree=f"{OUT}/04.meme_structure/final_family.treefile"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+
+        CORES=$("{PY}" - <<'PY'
+import os
+try:
+    print(len(os.sched_getaffinity(0)))
+except Exception:
+    print(1)
+PY
+)
+        if [ -z "$CORES" ] || [ "$CORES" -lt 1 ]; then CORES=$(nproc 2>/dev/null || echo 1); fi
+
+        T=$(( {threads} < CORES ? {threads} : CORES ))
+        [ "$T" -ge 1 ] || T=1
+
+        iqtree2 -s {input.aln} -m MFP -T $T -fast -pre {OUT}/04.meme_structure/final_family
+        test -s {output.tree}
+        """
+
+
+rule meme_parse_sites:
+    """
+    从 MEME 输出目录解析 motif hits（每条蛋白上每个 motif 的 start/end）
+    产出：motif_hits.tsv + protein_len.tsv
+    """
+    input:
+        pep=f"{OUT}/04.meme_structure/final_family.pep.fa",
+        meme_txt=f"{OUT}/04.meme_structure/meme_out/meme.txt"
+    output:
+        hits=f"{OUT}/04.meme_structure/meme_out/motif_hits.tsv",
+        lens=f"{OUT}/04.meme_structure/meme_out/protein_len.tsv"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/parse_meme_sites.py" \
+          --pep {input.pep} \
+          --meme_txt {input.meme_txt} \
+          --out_hits {output.hits} \
+          --out_lens {output.lens}
+        """
+
+
+rule meme_tree_motif_plot:
+    input:
+        tree=f"{OUT}/04.meme_structure/final_family.treefile",
+        hits=f"{OUT}/04.meme_structure/meme_out/motif_hits.tsv",
+        lens=f"{OUT}/04.meme_structure/meme_out/protein_len.tsv",
+        domain=f"{OUT}/04.meme_structure/meme_out/domain.tsv",
+        gene=f"{OUT}/04.meme_structure/meme_out/gene_structure.tsv"
+    output:
+        pdf=f"{OUT}/99.result/{FAMILY}_MotifTree.pdf"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/99.result
+        {RSCRIPT} {PROJ_SCRIPTS}/plot_meme_tree.R \
+          --tree {input.tree} \
+          --motif_tsv {input.hits} \
+          --len_tsv {input.lens} \
+          --domain_tsv {input.domain} \
+          --gene_tsv {input.gene} \
+          --family "{FAMILY}" \
+          --out {output.pdf}
+        """
+
+
+# =========================
+# 模块5：启动子提取（可选FIMO）
+# =========================
+rule promoter_fasta:
+    input:
+        genome=T_GENOME,
+        chrlen=f"{OUT}/03.chromosome_map/chr.length",
+        bed=f"{OUT}/03.chromosome_map/family_genes.bed"
+    output:
+        fa=f"{OUT}/05.promoter_cis/family_promoter_{PROMOTER_LEN}bp.fa",
+        bed=f"{OUT}/05.promoter_cis/family_promoter_{PROMOTER_LEN}bp.bed"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/05.promoter_cis
+        bash {PROJ_SCRIPTS}/promoter_extract.sh \
+          {input.bed} {input.chrlen} {input.genome} {PROMOTER_LEN} \
+          {output.bed} {output.fa}
+        """
+
+
+rule fimo_scan_optional:
+    input:
+        fa=f"{OUT}/05.promoter_cis/family_promoter_{PROMOTER_LEN}bp.fa",
+        motif=lambda wc: config["cis"]["motif_meme_file"]
+    output:
+        summary=f"{OUT}/05.promoter_cis/cis_summary.tsv",
+        plot=f"{OUT}/99.result/{FAMILY}_CisSummary.pdf"
+    threads: THREADS
+    run:
+        if not config["cis"]["enable_fimo"]:
+            shell(f"mkdir -p {OUT}/05.promoter_cis {OUT}/99.result")
+            shell(f"echo -e 'motif_id\\tcount' > {output.summary}")
+            shell(f"{RSCRIPT} -e \"pdf('{output.plot}'); plot.new(); text(0.5,0.5,'FIMO disabled'); dev.off()\"")
+        else:
+            pval = config["cis"]["fimo_pvalue"]
+            shell(rf"""
+                set -euo pipefail
+                mkdir -p {OUT}/05.promoter_cis/fimo_out {OUT}/99.result
+                fimo --oc {OUT}/05.promoter_cis/fimo_out --thresh {pval} {input.motif} {input.fa}
+                "{PY}" "{PROJ_SCRIPTS}/cis_fimo_summary.py" \
+                  --fimo {OUT}/05.promoter_cis/fimo_out/fimo.tsv \
+                  --out {output.summary}
+                {RSCRIPT} {PROJ_SCRIPTS}/plot_cis_summary.R \
+                  --in_tsv {output.summary} --family "{FAMILY}" --out {output.plot}
+            """)
+
+
+# =========================
+# 模块6：蛋白理化性质
+# =========================
+WOLF_ENABLE = str(config.get("wolfpsort", {}).get("enable", "false")).strip().lower() in ("1","true","yes","y")
+WOLF_CMD = config.get("wolfpsort", {}).get("cmd", "wolfpsort")
+WOLF_ORG = config.get("wolfpsort", {}).get("organism", "plant")
+
+
+rule wolfpsort_predict:
+    input:
+        pep=f"{OUT}/04.meme_structure/final_family.pep.fa"
+    output:
+        tsv=f"{OUT}/06.protein_property/wolfpsort.tsv"
+    threads: THREADS
+    run:
+        if not WOLF_ENABLE:
+            shell(f"mkdir -p {OUT}/06.protein_property")
+            shell(f"echo -e 'seq_id\\twolf_loc\\twolf_score\\twolf_scores' > {output.tsv}")
+        else:
+            shell(rf"""
+                set -euo pipefail
+                mkdir -p {OUT}/06.protein_property
+                "{PY}" "{PROJ_SCRIPTS}/wolfpsort_predict.py" \
+                  --pep {input.pep} \
+                  --out {output.tsv} \
+                  --cmd "{WOLF_CMD}" \
+                  --organism "{WOLF_ORG}"
+            """)
+
+
+rule protein_properties:
+    input:
+        pep=f"{OUT}/04.meme_structure/final_family.pep.fa",
+        wolf=f"{OUT}/06.protein_property/wolfpsort.tsv"
+    output:
+        f"{OUT}/06.protein_property/{FAMILY}_protein_properties.csv"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/06.protein_property
+        "{PY}" "{PROJ_SCRIPTS}/protein_properties.py" \
+          --pep {input.pep} \
+          --wolf_tsv {input.wolf} \
+          --out {output}
+        """
+
+
+# =========================
+# 模块7：共线性（MCScanX，多物种圆形图 + 家族高亮）
+# =========================
+SYNT_ALL = [TARGET] + SYNT_NAMES
+N_SPECIES = len(SYNT_ALL)
+
+
+rule prep_species_for_mcscanx:
+    """
+    为每个物种准备：
+      - ann.clean.gff3 / ann.clean.filtered.gff3（AGAT 转换 + 越界过滤）
+      - pep.fa（gffread 从 filtered gff 提取蛋白）
+      - genes.bed（从 filtered gff 提取 transcript 坐标，ID 与 pep header 对齐）
+    """
+    input:
+        gff=lambda wc: T_GFF if wc.sp == TARGET else [s for s in SYNTENY if s["name"] == wc.sp][0]["gff3"],
+        genome=lambda wc: T_GENOME if wc.sp == TARGET else [s for s in SYNTENY if s["name"] == wc.sp][0]["genome_fa"]
+    output:
+        clean_gff=f"{OUT}/07.synteny/{{sp}}/ann.clean.gff3",
+        filtered_gff=f"{OUT}/07.synteny/{{sp}}/ann.clean.filtered.gff3",
+        kill=f"{OUT}/07.synteny/{{sp}}/out_of_bounds.kill.txt",
+        pep=f"{OUT}/07.synteny/{{sp}}/pep.fa",
+        bed=f"{OUT}/07.synteny/{{sp}}/genes.bed"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/07.synteny/{wildcards.sp}
+
+        agat_convert_sp_gff2gff3.pl -g {input.gff} -o {output.clean_gff}
+
+        samtools faidx {input.genome}
+
+        awk 'BEGIN{{FS="\t"}}
+             NR==FNR{{len[$1]=$2; next}}
+             ($1 in len) && ($4<1 || $5>len[$1]) {{
+                 if (match($9,/Parent=([^;]+)/,a)) {{
+                     n=split(a[1],p,","); for(i=1;i<=n;i++) print p[i];
+                 }} else if (match($9,/ID=([^;]+)/,b)) {{
+                     print b[1];
+                 }}
+             }}' {input.genome}.fai {output.clean_gff} | sort -u > {output.kill}
+
+        if [ -s {output.kill} ]; then
+            PREFIX="$(cd "$(dirname "$(command -v agat_convert_sp_gff2gff3.pl)")/.." && pwd)"
+            PERL="$PREFIX/bin/perl"
+            FILTER="$PREFIX/bin/agat_sp_filter_feature_from_kill_list.pl"
+            env -u PERL5LIB -u PERL5OPT -u PERL_LOCAL_LIB_ROOT -u PERL_MB_OPT -u PERL_MM_OPT \
+              "$PERL" "$FILTER" \
+                --gff {output.clean_gff} \
+                --kill_list {output.kill} \
+                --output {output.filtered_gff}
+        else
+            cp {output.clean_gff} {output.filtered_gff}
+        fi
+
+        gffread {output.filtered_gff} -g {input.genome} -y {output.pep}
+
+        awk 'BEGIN{{FS="\t"; OFS="\t"}}
+             $0 !~ /^#/ && ($3=="mRNA" || $3=="transcript") {{
+                id="";
+                if (match($9,/ID=([^;]+)/,a)) id=a[1];
+                if (id!="") {{
+                   s=$4-1; if (s<0) s=0;
+                   print $1, s, $5, id, 0, $7
+                }}
+             }}' {output.filtered_gff} | sort -k1,1 -k2,2n > {output.bed}
+        """
+
+
+rule synteny_genomes_manifest:
+    input:
+        prep_pep=expand(f"{OUT}/07.synteny/{{sp}}/pep.fa", sp=SYNT_ALL),
+        prep_gff=expand(f"{OUT}/07.synteny/{{sp}}/ann.clean.filtered.gff3", sp=SYNT_ALL)
+    output:
+        tsv=f"{OUT}/07.synteny/genomes.tsv"
+    threads: THREADS
+    run:
+        import os
+        from pathlib import Path
+
+        out = Path(output.tsv)
+        out.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(out, "w") as w:
+            w.write("genomeID\tgff3\tpep\n")
+            for sp in SYNT_ALL:
+                gff = f"{OUT}/07.synteny/{sp}/ann.clean.filtered.gff3"
+                pep = f"{OUT}/07.synteny/{sp}/pep.fa"
+                if not (os.path.exists(gff) and os.path.getsize(gff) > 0):
+                    raise ValueError(f"[ERROR] missing/empty gff: {gff}")
+                if not (os.path.exists(pep) and os.path.getsize(pep) > 0):
+                    raise ValueError(f"[ERROR] missing/empty pep: {pep}")
+                w.write(f"{sp}\t{gff}\t{pep}\n")
+
+
+# =========================
+# GENESPACE (基于你已有的清洗GFF+pep)
+# =========================
+GENESPACE_GENOMES = ",".join(SYNT_ALL)
+GENESPACE_REPO = f"{OUT}/07.synteny/genespace/rawGenomes"
+GENESPACE_WD   = f"{OUT}/07.synteny/genespace/wd"
+
+# 你的 MCScanX 程序路径（必须是“包含 MCScanX 可执行文件”的目录）
+MCSCANX_DIR = config.get("mcscanx_dir", "/path/to/MCScanX")
+
+STAGED_GFF = expand(f"{OUT}/07.synteny/genespace/rawGenomes/{{sp}}/{{sp}}.gff3", sp=SYNT_ALL)
+STAGED_PEP = expand(f"{OUT}/07.synteny/genespace/rawGenomes/{{sp}}/{{sp}}.faa",  sp=SYNT_ALL)
+
+rule genespace_stage_inputs:
+    input:
+        gff=f"{OUT}/07.synteny/{{sp}}/ann.clean.filtered.gff3",
+        pep=f"{OUT}/07.synteny/{{sp}}/pep.fa"
+    output:
+        staged_gff=f"{OUT}/07.synteny/genespace/rawGenomes/{{sp}}/{{sp}}.gff3",
+        staged_pep=f"{OUT}/07.synteny/genespace/rawGenomes/{{sp}}/{{sp}}.faa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/07.synteny/genespace/rawGenomes/{wildcards.sp}
+
+        GFF_REAL=$("{PY}" -c "import os; print(os.path.realpath('{input.gff}'))")
+        PEP_REAL=$("{PY}" -c "import os; print(os.path.realpath('{input.pep}'))")
+
+        ln -sf "$GFF_REAL" {output.staged_gff}
+        ln -sf "$PEP_REAL" {output.staged_pep}
+        """
+GENESPACE_WD   = f"{OUT}/07.synteny/genespace/wd"
+GENESPACE_GENOMES = ",".join(SYNT_ALL)
+
+rule genespace_prepare_wd:
+    input:
+        bed=f"{OUT}/07.synteny/{{sp}}/genes.bed",
+        pep=f"{OUT}/07.synteny/{{sp}}/pep.fa"
+    output:
+        bed_out=f"{GENESPACE_WD}/bed/{{sp}}.bed",
+        pep_out=f"{GENESPACE_WD}/peptide/{{sp}}.fa"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {GENESPACE_WD}/bed {GENESPACE_WD}/peptide
+
+        SP="{wildcards.sp}"
+
+        # 1) pep: header 加前缀 + 清洗序列字符（DIAMOND 不接受 '.'）
+        awk -v SP="$SP" '
+          /^>/ {{
+            sub(/^>/, ">"SP"|");
+            print;
+            next
+          }}
+          {{
+            gsub(/\r/, "");
+            gsub(/\./, "X");         # '.' -> X
+            gsub(/\*/, "");          # 去掉 '*'
+            gsub(/[^A-Za-z]/, "X");  # 其它奇怪字符 -> X（更稳）
+            print toupper($0)
+          }}
+        ' {input.pep} > {output.pep_out}
+
+        # 导出 pep id 白名单
+        grep '^>' {output.pep_out} | sed 's/^>//; s/[[:space:]].*$//' | sort -u > {output.pep_out}.ids
+
+        # 2) bed: 输出 GENESPACE 兼容 4 列，并按 pep 白名单过滤 (bed ⊆ pep)
+        awk -v SP="$SP" 'BEGIN{{FS=OFS="\t"}}{{
+            id=SP"|" $4; 
+            chr=SP"_"$1;  # 强制给 chr 添加前缀
+            # 如果 chr 是纯数字或空，强制转为字符型（避免后续问题）
+            if (chr ~ /^[0-9]+$/ || chr == "") chr = SP"_chr"chr;
+            print chr, $2, $3, id
+        }}' {input.bed} \
+          | awk 'BEGIN{{FS=OFS="\t"}} NR==FNR{{ok[$1]=1; next}} ($4 in ok)' {output.pep_out}.ids - \
+          > {output.bed_out}
+
+        rm -f {output.pep_out}.ids
+
+        # 文件检查：确保 bed 和 pep 文件生成正确
+        test -s {output.bed_out}
+        test -s {output.pep_out}
+        echo "BED file generated: {output.bed_out}, PEP file generated: {output.pep_out}"
+
+        # 追加 debug 输出
+        echo "Generated BED file first few lines:"
+        head -n 5 {output.bed_out}
+        echo "Generated PEP file first few lines:"
+        head -n 5 {output.pep_out}
+        """
+
+
+GS_BEDS = expand(f"{GENESPACE_WD}/bed/{{sp}}.bed", sp=SYNT_ALL)
+GS_PEPS = expand(f"{GENESPACE_WD}/peptide/{{sp}}.fa", sp=SYNT_ALL)
+
+rule run_genespace:
+    input:
+        beds=GS_BEDS,
+        peps=GS_PEPS
+    output:
+        rds=f"{OUT}/07.synteny/genespace/genespace.gsParam.rds",
+        pdf=f"{OUT}/99.result/GENESPACE_riparian.pdf"
+    log:
+        f"{OUT}/07.synteny/genespace/genespace.run.log"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/07.synteny/genespace {OUT}/99.result
+        {{
+          echo "[DEBUG] date: $(date)"
+          export PATH="/home/liux/miniconda3/envs/plantfamilyallin/bin:$PATH"
+          echo -n "[DEBUG] orthofinder="; command -v orthofinder || true
+          orthofinder -h | head -n 3 || true
+
+          echo "[DEBUG] run Rscript..."
+          {RSCRIPT} {PROJ_SCRIPTS}/run_genespace.R \
+            --wd "{GENESPACE_WD}" \
+            --path2mcscanx "{MCSCANX_DIR}" \
+            --genomes "{GENESPACE_GENOMES}" \
+            --overwrite \
+            --ref "{TARGET}" \
+            --out_rds "{output.rds}" \
+            --out_pdf "{output.pdf}" \
+            --skip_parse
+        }} > "{log}" 2>&1
+
+        test -s "{output.rds}"
+        test -s "{output.pdf}"
+        """
+
+
+
+
+
+
+# =========================
+# 模块8：系统发育树
+# =========================
+rule phylo_merge_fasta:
+    input:
+        target=f"{OUT}/04.meme_structure/final_family.pep.fa",
+        model=MODEL_PEP
+    output:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.pep.fa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/08.phylogeny
+        "{PY}" "{PROJ_SCRIPTS}/merge_prefix_fasta.py" \
+          --target_fa {input.target} \
+          --model_fa {input.model} \
+          --out {output} \
+          --target_prefix "Target|" \
+          --model_prefix "Model|"
+        """
+
+
+rule phylo_mafft:
+    input:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.pep.fa"
+    output:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.aln.fa"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mafft --auto --thread {threads} {input} > {output}
+        """
+
+
+rule phylo_trim:
+    input:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.aln.fa"
+    output:
+        f"{OUT}/08.phylogeny/{FAMILY}_combined.aln.trim.fa"
+    threads: THREADS
+    run:
+        enable_trim = bool(config.get("phylo", {}).get("enable_trim", True))
+        if not enable_trim:
+            shell(f"cp {input} {output}")
+        else:
+            mode = config.get("phylo", {}).get("trimal_mode", "automated1")
+            if mode == "automated1":
+                shell(rf"trimal -in {input} -out {output} -automated1")
+            else:
+                shell(rf"cp {input} {output}")
+
+
+rule phylo_iqtree:
+    input:
+        aln=f"{OUT}/08.phylogeny/{FAMILY}_combined.aln.trim.fa"
+    output:
+        tree=f"{OUT}/08.phylogeny/{FAMILY}.treefile"
+    threads: THREADS
+    params:
+        model=lambda wc: config.get("phylo", {}).get("iqtree_model", "MFP"),
+        boot=lambda wc: int(config.get("phylo", {}).get("bootstrap", 1000)),
+        alrt=lambda wc: int(config.get("phylo", {}).get("alrt", 1000))
+    shell:
+        r"""
+        set -euo pipefail
+
+        CORES=$("{PY}" - <<'PY'
+import os
+try:
+    print(len(os.sched_getaffinity(0)))
+except Exception:
+    print(1)
+PY
+)
+        if [ -z "$CORES" ] || [ "$CORES" -lt 1 ]; then CORES=$(nproc 2>/dev/null || echo 1); fi
+
+        T=$(( {threads} < CORES ? {threads} : CORES ))
+        [ "$T" -ge 1 ] || T=1
+
+        iqtree2 -s {input.aln} \
+          -m {params.model} \
+          -B {params.boot} \
+          --alrt {params.alrt} \
+          -T $T \
+          -pre {OUT}/08.phylogeny/{FAMILY}
+
+        test -s {output.tree}
+        """
+
+
+rule phylo_plot:
+    input:
+        tree=f"{OUT}/08.phylogeny/{FAMILY}.treefile"
+    output:
+        f"{OUT}/99.result/{FAMILY}_PhyloTree.pdf"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/99.result
+        {RSCRIPT} {PROJ_SCRIPTS}/plot_tree.R \
+          --tree {input.tree} \
+          --family "{FAMILY}" \
+          --out {output}
+        """
+
+
+# =========================
+# 模块9：选择压力 Ka/Ks + Ks分布（基于家族 paralog pairs）
+# =========================
+KAKS_ENABLE = bool(config.get("kaks", {}).get("enable", True))
+
+KAKS_BIN_DIR = config.get("kaks", {}).get("kaks_bin_dir", "")
+PAL2NAL = config.get("kaks", {}).get("pal2nal", "pal2nal.pl")
+MAFFT = config.get("kaks", {}).get("mafft", "mafft")
+KAKS_METHOD = config.get("kaks", {}).get("method", "YN")
+
+KAKS_MIN_KS  = float(config.get("kaks", {}).get("min_ks", 0.001))
+KAKS_MAX_KS  = float(config.get("kaks", {}).get("max_ks", 3))
+KAKS_MAX_W   = float(config.get("kaks", {}).get("max_kaks", 5))
+
+KAKS_OUTDIR = f"{OUT}/09.selection"
+KAKS_PAIRS  = f"{KAKS_OUTDIR}/pairs.tsv"
+KAKS_RAW    = f"{KAKS_OUTDIR}/kaks/kaks.raw.tsv"
+KAKS_FILT   = f"{KAKS_OUTDIR}/kaks/kaks.filtered.tsv"
+
+rule kaks_pairs_from_family:
+    """
+    用 final_family_members.list 生成家族内部两两组合基因对（paralog pairs）
+    """
+    input:
+        genes=f"{OUT}/02.family_id/final_family_members.list"
+    output:
+        KAKS_PAIRS
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {KAKS_OUTDIR}
+        "{PY}" "{PROJ_SCRIPTS}/kaks_pairs_from_list.py" \
+          --gene_list "{input.genes}" \
+          --out "{output}"
+        """
+
+rule kaks_build_axt:
+    """
+    对每一对基因生成 AXT（protein align -> pal2nal -> AXTConvertor）
+    CDS 使用模块1的 target.cds.longest.fa（与你家族ID一致）
+    """
+    input:
+        pairs=KAKS_PAIRS,
+        cds=f"{OUT}/01.cds_protein/target.cds.longest.fa"
+    output:
+        directory(f"{KAKS_OUTDIR}/axt")
+    threads: 6
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {KAKS_OUTDIR}/axt
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_make_axt_batch.py" \
+          --pairs "{input.pairs}" \
+          --cds_fa "{input.cds}" \
+          --outdir "{KAKS_OUTDIR}/axt" \
+          --mafft "{MAFFT}" \
+          --pal2nal "{PAL2NAL}" \
+          --axtconvertor "{KAKS_BIN_DIR}/AXTConvertor" \
+          --threads {threads}
+        """
+
+rule kaks_run:
+    """
+    跑 KaKs_Calculator 计算 Ka Ks Ka/Ks
+    """
+    input:
+        axt_dir=f"{KAKS_OUTDIR}/axt"
+    output:
+        raw=KAKS_RAW
+    threads: 6
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {KAKS_OUTDIR}/kaks
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_run_batch.py" \
+          --axt_dir "{input.axt_dir}" \
+          --kaks "{KAKS_BIN_DIR}/KaKs" \
+          --method "{KAKS_METHOD}" \
+          --out "{output.raw}" \
+          --threads {threads}
+        """
+
+rule kaks_filter:
+    input:
+        raw=KAKS_RAW,
+        pairs=KAKS_PAIRS
+    output:
+        KAKS_FILT
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/kaks_filter.py" \
+          --kaks_raw "{input.raw}" \
+          --pairs "{input.pairs}" \
+          --min_ks {KAKS_MIN_KS} \
+          --max_ks {KAKS_MAX_KS} \
+          --max_w {KAKS_MAX_W} \
+          --out "{output}"
+        """
+
+rule plot_kaks:
+    input:
+        kaks=KAKS_FILT
+    output:
+        ks=f"{OUT}/99.result/Ks_distribution.pdf",
+        w=f"{OUT}/99.result/KaKs_distribution.pdf",
+        scatter=f"{OUT}/99.result/Ka_vs_Ks_scatter.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/99.result
+        {RSCRIPT} {PROJ_SCRIPTS}/plot_kaks.R \
+          --kaks_tsv "{input.kaks}" \
+          --out_ks "{output.ks}" \
+          --out_w "{output.w}" \
+          --out_scatter "{output.scatter}"
+        """
+
+# =========================
+# 模块10：全基因组 self-synteny 锚点对 Ks 背景分布（MCScanX self）
+# =========================
+SYK_ENABLE = bool(config.get("syntenic_kaks", {}).get("enable", True))
+
+SYK_OUTDIR  = f"{OUT}/10.syntenic_kaks"
+SYK_MCS_DIR = f"{SYK_OUTDIR}/mcscanx/{TARGET}_self"      # ✅ 单层目录
+SYK_PREFIX  = f"{SYK_MCS_DIR}/{TARGET}_self"             # ✅ 前缀文件名（不再双层）
+
+SYK_MIN_KS = float(config.get("syntenic_kaks", {}).get("min_ks", 0.001))
+SYK_MAX_KS = float(config.get("syntenic_kaks", {}).get("max_ks", 5))
+SYK_MAX_W  = float(config.get("syntenic_kaks", {}).get("max_kaks", 5))
+
+SYK_EVALUE = config.get("syntenic_kaks", {}).get("diamond_evalue", 1e-5)
+SYK_MTS    = int(config.get("syntenic_kaks", {}).get("diamond_max_target_seqs", 5))
+
+SYK_PAIRS  = f"{SYK_OUTDIR}/pairs.tsv"
+SYK_COL    = f"{SYK_PREFIX}.collinearity"
+SYK_RAW    = f"{SYK_OUTDIR}/kaks/kaks.raw.tsv"
+SYK_FILT   = f"{SYK_OUTDIR}/kaks/kaks.filtered.tsv"
+
+
+# 10.1 生成 self 的 MCScanX gff（用 longest pep 的 ID 白名单确保一致）
+rule syk_mcscanx_gff:
+    input:
+        gff=f"{OUT}/01.cds_protein/annotation.clean.filtered.gff3",
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa"
+    output:
+        gff=f"{SYK_PREFIX}.gff"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{SYK_MCS_DIR}"
+
+        grep '^>' "{input.pep}" | sed 's/^>//; s/[[:space:]].*$//' | sort -u > "{SYK_PREFIX}.pep.ids"
+
+        awk 'BEGIN{{FS="\t"; OFS="\t"}}
+             NR==FNR{{ok[$1]=1; next}}
+             $0!~/^#/ && ($3=="mRNA" || $3=="transcript") {{
+               id="";
+               if (match($9,/ID=([^;]+)/,a)) id=a[1];
+               if (id!="" && (id in ok)) {{
+                 print $1, id, $4, $5
+               }}
+             }}' "{SYK_PREFIX}.pep.ids" "{input.gff}" \
+          | sort -k1,1 -k3,3n > "{output.gff}"
+
+        rm -f "{SYK_PREFIX}.pep.ids"
+        test -s "{output.gff}"
+        """
+
+
+# 10.2 生成 self BLAST（diamond blastp 输出 MCScanX 兼容 12 列）
+rule syk_self_blast:
+    input:
+        pep=f"{OUT}/01.cds_protein/target.pep.longest.fa"
+    output:
+        blast=f"{SYK_PREFIX}.blast"
+    threads: THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{SYK_MCS_DIR}"
+
+        diamond makedb --in "{input.pep}" -d "{SYK_PREFIX}" --quiet
+
+        diamond blastp \
+          -q "{input.pep}" -d "{SYK_PREFIX}" \
+          -o "{output.blast}" \
+          -f 6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore \
+          -e "{SYK_EVALUE}" \
+          --max-target-seqs "{SYK_MTS}" \
+          --threads {threads}
+
+        test -s "{output.blast}"
+        """
+
+
+# 10.3 运行 MCScanX self 生成 collinearity
+rule syk_run_mcscanx:
+    input:
+        gff=f"{SYK_PREFIX}.gff",
+        blast=f"{SYK_PREFIX}.blast"
+    output:
+        col=f"{SYK_PREFIX}.collinearity"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        cd "{SYK_MCS_DIR}"
+
+        "/home/liux/miniconda3/envs/plantfamilyallin/bin/MCScanX" "{TARGET}_self"
+
+        test -s "{TARGET}_self.collinearity"
+        """
+
+
+# 10.4 collinearity -> syntenic pairs
+rule syk_pairs_from_collinearity:
+    input:
+        col=SYK_COL
+    output:
+        SYK_PAIRS
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{SYK_OUTDIR}"
+        "{PY}" "{PROJ_SCRIPTS}/parse_mcscanx_collinearity_to_pairs.py" \
+          --collinearity "{input.col}" \
+          --out "{output}" \
+          --min_block_hits 5
+        test -s "{output}"
+        """
+
+
+# 10.5 复用模块9的 axt/kaks/filter（只替换 pairs 输入与输出目录）
+rule syk_build_axt:
+    input:
+        pairs=SYK_PAIRS,
+        cds=f"{OUT}/01.cds_protein/target.cds.longest.fa"
+    output:
+        directory(f"{SYK_OUTDIR}/axt")
+    threads: 6
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{SYK_OUTDIR}/axt"
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_make_axt_batch.py" \
+          --pairs "{input.pairs}" \
+          --cds_fa "{input.cds}" \
+          --outdir "{SYK_OUTDIR}/axt" \
+          --mafft "{MAFFT}" \
+          --pal2nal "{PAL2NAL}" \
+          --axtconvertor "{KAKS_BIN_DIR}/AXTConvertor" \
+          --threads {threads}
+        """
+
+rule syk_run_kaks:
+    input:
+        axt_dir=f"{SYK_OUTDIR}/axt"
+    output:
+        raw=SYK_RAW
+    threads: 6
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p "{SYK_OUTDIR}/kaks"
+
+        "{PY}" "{PROJ_SCRIPTS}/kaks_run_batch.py" \
+          --axt_dir "{input.axt_dir}" \
+          --kaks "{KAKS_BIN_DIR}/KaKs" \
+          --method "{KAKS_METHOD}" \
+          --out "{output.raw}" \
+          --threads {threads}
+        """
+
+rule syk_filter:
+    input:
+        raw=SYK_RAW,
+        pairs=SYK_PAIRS
+    output:
+        SYK_FILT
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        "{PY}" "{PROJ_SCRIPTS}/kaks_filter.py" \
+          --kaks_raw "{input.raw}" \
+          --pairs "{input.pairs}" \
+          --min_ks {SYK_MIN_KS} \
+          --max_ks {SYK_MAX_KS} \
+          --max_w {SYK_MAX_W} \
+          --out "{output}"
+        """
+
+rule plot_family_vs_syntenic_ks:
+    input:
+        fam=f"{OUT}/09.selection/kaks/kaks.filtered.tsv",
+        syn=SYK_FILT
+    output:
+        pdf=f"{OUT}/99.result/Ks_family_vs_syntenic.pdf"
+    threads: 1
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {OUT}/99.result
+        {RSCRIPT} {PROJ_SCRIPTS}/plot_family_vs_syntenic_Ks.R \
+          --family_kaks "{input.fam}" \
+          --syntenic_kaks "{input.syn}" \
+          --family_name "{FAMILY}" \
+          --xmax 5 \
+          --out_pdf "{output.pdf}"
+        """
+
